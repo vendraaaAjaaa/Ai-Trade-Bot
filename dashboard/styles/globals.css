@@ -1,0 +1,74 @@
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Inter:wght@300;400;500;600;700&display=swap');
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg-primary: #0a0e17;
+  --bg-secondary: #0f1623;
+  --bg-card: #151e2d;
+  --bg-elevated: #1c2a3f;
+  --accent-green: #00d4a0;
+  --accent-red: #ff4757;
+  --accent-blue: #3d8ef8;
+  --accent-yellow: #ffd32a;
+  --text-primary: #e8edf5;
+  --text-secondary: #8899aa;
+  --border: #1c2a3f;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  overflow-x: hidden;
+}
+
+.font-mono { font-family: 'JetBrains Mono', monospace; }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: var(--bg-secondary); }
+::-webkit-scrollbar-thumb { background: var(--bg-elevated); border-radius: 2px; }
+
+/* Animations */
+@keyframes pulse-green {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(0, 212, 160, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(0, 212, 160, 0); }
+}
+@keyframes pulse-red {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 71, 87, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(255, 71, 87, 0); }
+}
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes glow {
+  0%, 100% { text-shadow: 0 0 8px rgba(0, 212, 160, 0.6); }
+  50% { text-shadow: 0 0 16px rgba(0, 212, 160, 1); }
+}
+
+.animate-fade-in { animation: fadeIn 0.3s ease-out; }
+.animate-glow { animation: glow 2s ease-in-out infinite; }
+.live-dot { animation: pulse-green 2s infinite; }
+.live-dot-red { animation: pulse-red 2s infinite; }
+
+.card {
+  @apply bg-dark-700 border border-dark-600 rounded-xl p-4;
+}
+
+.badge-long { @apply text-xs font-mono px-2 py-0.5 rounded bg-accent-green/20 text-accent-green border border-accent-green/30; }
+.badge-short { @apply text-xs font-mono px-2 py-0.5 rounded bg-accent-red/20 text-accent-red border border-accent-red/30; }
+.badge-mode { @apply text-xs font-mono px-2 py-0.5 rounded bg-accent-blue/20 text-accent-blue border border-accent-blue/30; }
+
+.stat-value { @apply text-2xl font-bold font-mono; }
+.stat-label { @apply text-xs text-gray-400 uppercase tracking-wider mt-1; }
+
+.positive { color: var(--accent-green); }
+.negative { color: var(--accent-red); }
+.neutral { color: var(--text-secondary); }
+
+/* Confidence meter */
+.confidence-bar { transition: width 0.5s ease; }
