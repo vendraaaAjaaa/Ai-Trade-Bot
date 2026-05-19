@@ -9,39 +9,40 @@ import { dryRunExecutor } from './execution/dryrun/dryRunExecutor';
 import { liveExecutor } from './execution/live/liveExecutor';
 import { telegramNotifier } from './telegram/telegramBot';
 import { createApiServer } from './dashboard/apiServer';
+import { marketRegimeEngine } from './regime/marketRegimeEngine';
+import { sessionFilter } from './session/sessionFilter';
+import { strategyManager } from './strategy/strategyModes';
+import { frequencyLimiter } from './strategy/frequencyLimiter';
 import { trackTrade, detectMEV } from './smartmoney/smartMoneyAnalysis';
 import { updateTradeBuffer } from './volume/volumeAnalysis';
 import { config } from './config';
+import { marketDataService } from './market/marketDataService';
 import type { TradingPair, Timeframe, AggregateTrade } from './utils/types';
+import type { NoTradeDecision } from './utils/types2';
 
-const log = createLogger('main');
+const log = createLogger('main-v2');
 
 async function bootstrap() {
-  log.info('=======================================================');
-  log.info('  AI AGENTIC TRADING AUTOMATION PLATFORM  v1.0.0');
-  log.info('=======================================================');
+  log.info('╔══════════════════════════════════════════════════════╗');
+  log.info('║   AI AGENTIC TRADING PLATFORM  v2.0 — DISCIPLINED   ║');
+  log.info('╚══════════════════════════════════════════════════════╝');
   log.info({ mode: config.trading.mode, pairs: config.trading.pairs }, 'Starting platform');
 
-  // ---- Database ----
+  // ---- Infrastructure ----
   log.info('Connecting to PostgreSQL...');
-  const dbOk = await db.healthCheck();
-  if (!dbOk) {
-    log.error('PostgreSQL connection failed. Check DB_HOST, DB_USER, DB_PASSWORD.');
-    process.exit(1);
-  }
+  if (!await db.healthCheck()) { log.error('PostgreSQL connection failed'); process.exit(1); }
   await runMigrations();
-  log.info('Database ready');
 
-  // ---- Redis ----
   log.info('Connecting to Redis...');
-  const redisOk = await redis.healthCheck();
-  if (!redisOk) {
-    log.warn('Redis connection failed. Platform will run without caching.');
-  } else {
-    log.info('Redis ready');
-  }
+  if (!await redis.healthCheck()) log.warn('Redis unavailable — running without cache');
 
-  // ---- Initialize signal buffers ----
+  // ---- Initialize strategy & frequency state ----
+  await strategyManager.initialize();
+  const mode = strategyManager.getMode();
+  const modeCfg = strategyManager.getConfig();
+  log.info({ mode, maxTrades: modeCfg.maxTradesPerDay, minConfidence: modeCfg.minConfidence }, 'Strategy mode loaded');
+
+  // ---- Initialize signal buffers & regime engine ----
   log.info('Loading historical candle buffers...');
   await signalEngine.initializeBuffers();
 
@@ -52,63 +53,100 @@ async function bootstrap() {
     config.trading.trendTimeframe as Timeframe,
   ];
 
-  const wsService = new BinanceWebSocketService(
-    config.trading.pairs as TradingPair[],
-    timeframes,
-  );
+  const wsService = new BinanceWebSocketService(config.trading.pairs as TradingPair[], timeframes);
 
-  // Handle candle events
+  // ---- Candle handler (WebSocket - may not work on some ISPs) ----
   wsService.on('candle', async ({ pair, timeframe, candle, isClosed }) => {
-    if (isClosed) {
-      await signalEngine.onCandleClose(pair, timeframe, candle);
+    try {
+      if (isClosed) {
+        await signalEngine.onCandleClose(pair, timeframe, candle);
+
+        // Update regime every 15 closed candles on primary TF
+        if (timeframe === config.trading.defaultTimeframe) {
+          const buffer = signalEngine.getBuffer(pair, timeframe);
+          if (buffer.length >= 50 && buffer.length % 15 === 0) {
+            const regime = await marketRegimeEngine.analyze(pair, buffer);
+            if (!regime.tradingAllowed) {
+              await telegramNotifier.sendRegimeAlert(pair, regime).catch(() => {});
+            }
+          }
+        }
+      }
+    } catch (err) {
+      log.error({ err, pair, timeframe }, 'CRITICAL: Candle handler crashed!');
     }
   });
 
-  // Handle aggregate trade events
+  // ---- Trade handler ----
   wsService.on('trade', async (trade: AggregateTrade) => {
     updateTradeBuffer(trade);
-
-    // Whale detection
-    const whale = trackTrade(trade);
-    if (whale) {
-      log.info({ pair: whale.pair, amountUsdt: whale.amountUsdt, significance: whale.significance }, 'Whale detected');
-    }
-
-    // MEV detection
+    trackTrade(trade);
     const mev = detectMEV(trade);
-    if (mev) {
-      log.warn({ type: mev.type, pair: mev.pair, confidence: mev.confidence }, 'MEV pattern detected');
-    }
+    if (mev) log.warn({ type: mev.type, pair: mev.pair }, 'MEV detected');
 
-    // Update dry run positions with latest price
     if (config.trading.mode === 'dryrun') {
       await dryRunExecutor.updatePositionPrice(trade.pair, trade.price);
     }
   });
 
-  // Handle ticker events  
-  wsService.on('ticker', (_ticker) => {
-    // Ticker updates are cached in redis by websocket service
-  });
-
-  wsService.on('connected', () => log.info('Market WebSocket connected and streaming'));
-  wsService.on('error', (err) => log.error({ err }, 'WebSocket error'));
-  wsService.on('fatal_error', (err) => {
-    log.error({ err }, 'Fatal WebSocket error');
-    process.exit(1);
-  });
-
+  wsService.on('connected', () => log.info('Binance WebSocket streaming'));
+  wsService.on('fatal_error', () => process.exit(1));
   wsService.start();
 
-  // ---- Wire up signal → execution ----
-  signalEngine.on('signal', async (signal) => {
-    log.info({ pair: signal.pair, direction: signal.direction, confidence: signal.confidence }, 'Executing signal');
+  // ---- REST API Candle Polling (ISP-resistant fallback) ----
+  // Since some ISPs block WebSocket kline streams, we poll every 30s via REST API
+  const lastCandleTime = new Map<string, number>();
 
-    // Send Telegram notification
+  async function pollCandles() {
+    for (const pair of config.trading.pairs as TradingPair[]) {
+      for (const tf of timeframes) {
+        try {
+          const candles = await marketDataService.fetchFromBinance(pair, tf, 2);
+          if (candles.length < 2) continue;
+
+          // The second-to-last candle is the latest CLOSED candle
+          const closedCandle = candles[candles.length - 2];
+          const key = `${pair}:${tf}`;
+          const lastTime = lastCandleTime.get(key) ?? 0;
+
+          if (closedCandle.openTime > lastTime) {
+            lastCandleTime.set(key, closedCandle.openTime);
+
+            // Skip the first poll (initialization) to avoid duplicate signals
+            if (lastTime > 0) {
+              log.info({ pair, tf, close: closedCandle.close, openTime: new Date(closedCandle.openTime).toISOString() },
+                '📊 REST poll: new closed candle detected');
+              await signalEngine.onCandleClose(pair, tf, closedCandle);
+            } else {
+              log.info({ pair, tf }, '📊 REST poll: baseline set');
+            }
+          }
+        } catch (err) {
+          log.warn({ err, pair, tf }, 'REST poll: failed to fetch candles');
+        }
+      }
+    }
+  }
+
+  // Initial baseline + start polling
+  await pollCandles();
+  setInterval(pollCandles, 30_000);
+  log.info({ intervalSec: 30, pairs: config.trading.pairs.length, timeframes: timeframes.length },
+    '🔄 REST candle polling started (ISP-resistant)');
+
+  // ---- Signal → Execution pipeline ----
+  signalEngine.on('signal', async (signal) => {
+    // Pre-execution session check
+    const session = sessionFilter.getCurrentSession();
+    if (!session.tradingAllowed) {
+      log.info({ session: session.name }, 'Signal skipped: session not tradeable');
+      return;
+    }
+
+    // Send Telegram alert for approved signal
     await telegramNotifier.sendSignalAlert(signal).catch(() => {});
 
     let position = null;
-
     if (config.trading.mode === 'dryrun') {
       position = await dryRunExecutor.executeSignal(signal);
     } else if (config.trading.mode === 'live') {
@@ -121,17 +159,35 @@ async function bootstrap() {
     }
   });
 
-  // Wire up position closed events
+  // ---- No-trade events ----
+  signalEngine.on('no_trade', async (data: { pair: string; decision: NoTradeDecision }) => {
+    log.debug({ pair: data.pair, category: data.decision.category, reason: data.decision.primaryReason }, 'No trade');
+    await telegramNotifier.sendNoTradeAlert(data.pair, data.decision).catch(() => {});
+  });
+
+  // ---- Position events ----
   dryRunExecutor.on('position_closed', async ({ position, reason }) => {
     await telegramNotifier.sendPositionClosed(position, reason).catch(() => {});
   });
 
   dryRunExecutor.on('position_liquidated', async (position) => {
     await telegramNotifier.sendPositionClosed(position, 'LIQUIDATED').catch(() => {});
-    await telegramNotifier.sendRiskWarning(`Position LIQUIDATED on ${position.pair}!`).catch(() => {});
+    const streak = await frequencyLimiter.getLossStreakState();
+    if (streak.inCooldown) {
+      await telegramNotifier.sendCooldownAlert(streak).catch(() => {});
+    }
   });
 
-  // ---- Daily report scheduler ----
+  // ---- Loss streak cooldown monitor ----
+  setInterval(async () => {
+    const streak = await frequencyLimiter.getLossStreakState();
+    if (streak.inCooldown && Date.now() >= streak.cooldownUntil) {
+      await frequencyLimiter.exitCooldown();
+      log.info('Cooldown period ended — resuming trading');
+    }
+  }, 60_000);
+
+  // ---- Daily report ----
   scheduleDailyReport();
 
   // ---- API Server ----
@@ -140,33 +196,30 @@ async function bootstrap() {
     log.info({ port: config.app.port }, 'API server started');
   });
 
-  log.info('=======================================================');
-  log.info(`  Platform running in ${config.trading.mode.toUpperCase()} mode`);
-  log.info(`  API: http://localhost:${config.app.port}`);
-  log.info(`  Pairs: ${config.trading.pairs.join(', ')}`);
-  log.info(`  Timeframe: ${config.trading.defaultTimeframe}`);
-  log.info('=======================================================');
+  const session = sessionFilter.getCurrentSession();
+  log.info('╔══════════════════════════════════════════════════════╗');
+  log.info(`║  Mode: ${config.trading.mode.padEnd(10)} Strategy: ${mode.padEnd(10)}          ║`);
+  log.info(`║  Session: ${session.name.padEnd(10)} Quality: ${session.quality}/100              ║`);
+  log.info(`║  API: http://localhost:${config.app.port}                        ║`);
+  log.info('╚══════════════════════════════════════════════════════╝');
 
-  // ---- Graceful shutdown ----
   process.on('SIGTERM', () => gracefulShutdown(wsService));
   process.on('SIGINT', () => gracefulShutdown(wsService));
 }
 
 function scheduleDailyReport() {
   const now = new Date();
-  const nextReport = new Date();
-  nextReport.setHours(23, 59, 0, 0);
-  if (nextReport <= now) nextReport.setDate(nextReport.getDate() + 1);
-
-  const delay = nextReport.getTime() - now.getTime();
+  const next = new Date();
+  next.setHours(23, 55, 0, 0);
+  if (next <= now) next.setDate(next.getDate() + 1);
   setTimeout(async () => {
     await telegramNotifier.sendDailyReport().catch(() => {});
-    setInterval(() => telegramNotifier.sendDailyReport().catch(() => {}), 24 * 60 * 60 * 1000);
-  }, delay);
+    setInterval(() => telegramNotifier.sendDailyReport().catch(() => {}), 86_400_000);
+  }, next.getTime() - now.getTime());
 }
 
 async function gracefulShutdown(ws: BinanceWebSocketService) {
-  log.info('Shutting down gracefully...');
+  log.info('Shutting down...');
   ws.stop();
   telegramNotifier.stop();
   await redis.close();
@@ -174,7 +227,4 @@ async function gracefulShutdown(ws: BinanceWebSocketService) {
   process.exit(0);
 }
 
-bootstrap().catch((err) => {
-  log.error({ err }, 'Fatal startup error');
-  process.exit(1);
-});
+bootstrap().catch((err) => { log.error({ err }, 'Fatal startup error'); process.exit(1); });

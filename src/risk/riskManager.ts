@@ -169,7 +169,9 @@ export class RiskManager {
   private isSameDay(timestamp: number): boolean {
     const today = new Date();
     const stored = new Date(timestamp);
-    return today.toDateString() === stored.toDateString();
+    return today.getUTCFullYear() === stored.getUTCFullYear()
+      && today.getUTCMonth() === stored.getUTCMonth()
+      && today.getUTCDate() === stored.getUTCDate();
   }
 
   private async countOpenPositions(): Promise<number> {

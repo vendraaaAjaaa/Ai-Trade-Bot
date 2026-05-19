@@ -2,8 +2,10 @@ FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Install dependencies
-COPY package.json package-lock.json* ./
+# Copy package files first (better layer caching)
+COPY package.json ./
+
+# npm install works without a lockfile
 RUN npm install
 
 # Build TypeScript

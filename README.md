@@ -1,310 +1,173 @@
-# ⚡ AI Agentic Trading Automation Platform
+# ⚡ AI Agentic Trading Automation Platform — v2.0 Disciplined
 
-A production-ready, AI-assisted crypto trading platform for **BTCUSDT**, **ETHUSDT**, and **SOLUSDT** — supporting Binance Futures, Dry Run / Paper Trading, Replay, Backtesting, and a real-time Next.js dashboard.
+> "The best trade is often the trade you do NOT take."
 
----
-
-## 🧠 Architecture Philosophy
-
-> AI is used ONLY as reasoning, validation, confidence scoring, and anomaly detection.  
-> All trade execution is **deterministic, auditable, and rule-based**.
+A production-ready, **institutionally-disciplined** AI trading platform. v2 transforms the system from a reactive signal hunter into a patient, selective probability filter.
 
 ---
 
-## 🗂 Project Structure
+## 🧠 Core Philosophy
+
+AI is used ONLY for: reasoning, validation, confidence scoring, anomaly detection.  
+All execution is **deterministic, auditable, and rule-based**.  
+The system **refuses bad trades** as aggressively as it accepts good ones.
+
+---
+
+## 🔄 v2 Signal Pipeline
 
 ```
-trading-platform/
-├── src/                         # Backend (Node.js + TypeScript)
-│   ├── config/                  # Environment & Zod config schema
-│   ├── database/                # PostgreSQL pool + migrations
-│   ├── redis/                   # Redis client + cache keys
-│   ├── market/                  # Market data service (REST + cache)
-│   ├── websocket/               # Binance WebSocket streaming
-│   ├── indicators/              # EMA, RSI, MACD, ATR, VWAP
-│   ├── patterns/                # BOS, CHOCH, OB, FVG, Breakout
-│   ├── volume/                  # Spike, Delta, Absorption, Whale
-│   ├── smartmoney/              # Whale tracking, MEV detection
-│   ├── ai/
-│   │   ├── agents/              # 5 specialized AI agents
-│   │   └── reasoning/           # Multi-agent orchestrator
-│   ├── confluence/              # Weighted scoring engine
-│   ├── signals/                 # Signal generation pipeline
-│   ├── execution/
-│   │   ├── live/                # Real Binance orders
-│   │   └── dryrun/              # Virtual wallet simulation
-│   ├── replay/                  # Historical replay engine
-│   ├── risk/                    # Risk manager (daily loss, cooldown, sizing)
-│   ├── analytics/               # Performance metrics
-│   ├── telegram/                # Telegram bot notifications
-│   ├── dashboard/               # Express API + Socket.IO server
-│   └── utils/                   # Types, logger
-├── dashboard/                   # Frontend (Next.js + Tailwind + Recharts)
-│   ├── pages/                   # index.tsx main dashboard
-│   ├── hooks/                   # useSocket, useTrading
-│   └── lib/                     # API client
-├── docker/                      # Dockerfiles
-├── docker-compose.yml
-├── .env.example
-└── README.md
+Market Data
+  → Market Regime Engine      (trending / ranging / choppy / manipulative)
+  → Chop & Manipulation Gate  (hard block if choppy/manipulative)
+  → Session Filter            (London / NY / overlap priority)
+  → Market Quality Score      (0–100 gate per strategy mode)
+  → Strategy Mode Gate        (regime + session allowed-list check)
+  → Confluence Engine         (20-factor weighted scoring)
+  → Confidence Gate           (mode-specific minimum)
+  → Multi-Timeframe Analysis  (trend / structure / trigger alignment)
+  → Patience Engine           (discipline evaluation)
+  → AI Multi-Agent Analysis   (7 agents: 5 deterministic + Codex + Gemini)
+  → Consensus Voting          (4/7 agents must agree, 0 vetos allowed)
+  → Consensus Score Gate      (mode-specific minimum)
+  → RR Gate                   (mode-specific minimum)
+  → Frequency Limiter         (daily trade cap per mode)
+  → Loss Streak Guard         (cooldown after 3 consecutive losses)
+  → Risk Manager              (position sizing, daily loss limit)
+  → Execution Engine          (dry run / live)
+  → Self-Review Engine        (post-trade AI journal)
 ```
+
+Every gate must pass. Any failure = **NO TRADE** with a logged reason.
+
+---
+
+## 📁 New Modules (v2)
+
+| Module | File | Purpose |
+|--------|------|---------|
+| Market Regime | `src/regime/marketRegimeEngine.ts` | Classifies trending/ranging/choppy/manipulative |
+| Quality Score | `src/quality/marketQualityScore.ts` | 0–100 market quality grade |
+| Session Filter | `src/session/sessionFilter.ts` | London/NY/overlap intelligence |
+| MTF Analysis | `src/mtf/multiTimeframeAnalysis.ts` | 3-timeframe alignment validation |
+| Patience Engine | `src/patience/patienceEngine.ts` | Discipline enforcement |
+| Consensus Voting | `src/consensus/consensusVoting.ts` | 7-agent vote system |
+| Strategy Modes | `src/strategy/strategyModes.ts` | 5 configurable trading styles |
+| Frequency Limiter | `src/strategy/frequencyLimiter.ts` | Daily limits + loss streak cooldown |
+| Self Review | `src/review/selfReviewEngine.ts` | Post-trade AI journal generation |
+| CLI Runner | `src/ai/shared/cliRunner.ts` | Stdin-pipe subprocess runner |
+| Extended Types | `src/utils/types2.ts` | All v2 type definitions |
+
+---
+
+## 🎯 Strategy Modes
+
+| Mode | Trades/Day | Min Confidence | Min RR | Best For |
+|------|-----------|----------------|--------|---------|
+| `scalping` | 5 | 72% | 1.5 | Momentum, London/NY sessions |
+| `swing` | 2 | 75% | 2.0 | Trend following, institutional |
+| `investing` | 1 | 70% | 2.5 | ETH/SOL spot accumulation |
+| `safe` | 1 | **90%** | 2.5 | Maximum capital preservation |
+| `aggressive` | 8 | 60% | 1.2 | Experimental, higher risk |
+
+Change mode via Telegram: `/mode swing`  
+Or API: `POST /api/strategy/mode {"mode":"safe"}`
+
+---
+
+## 🤖 7-Agent Consensus System
+
+| # | Agent | Type | Speciality |
+|---|-------|------|-----------|
+| 1 | VolumeAgent | Deterministic | Spikes, whale, absorption, spoofing |
+| 2 | PatternAgent | Deterministic | BOS, CHOCH, OB, FVG, breakout |
+| 3 | IndicatorAgent | Deterministic | EMA, RSI divergence, MACD, VWAP |
+| 4 | MEVAgent | Deterministic | Front-running, sandwich, manipulation |
+| 5 | RiskAgent | Deterministic | RR ratio, SL sizing, volatility |
+| 6 | CodexCLIAgent | CLI subprocess | Overall signal reasoning |
+| 7 | GeminiCLIAgent | CLI subprocess | Smart money + structure analysis |
+
+**Scoring:** deterministic 60% weight · CLI agents 40%  
+**Minimum:** 4/7 agents must vote in signal direction  
+**Hard veto:** RiskAgent score < 25 OR both CLI agents flag 2+ risks
+
+---
+
+## 🛡️ Loss Streak Protection
+
+After **3 consecutive losses**:
+- System enters **cooldown mode** for 90 minutes
+- All new trades blocked
+- Telegram alert sent
+- AI re-evaluates market conditions
+
+Resume manually: `POST /api/frequency/reset-cooldown`  
+Or via Telegram.
+
+---
+
+## 📊 Market Quality Grades
+
+| Score | Grade | Trading |
+|-------|-------|---------|
+| 90–100 | Excellent | ✅ All modes |
+| 70–89 | Tradeable | ✅ Most modes |
+| 50–69 | Risky | ⚠️ Aggressive only |
+| < 50 | No Trade | ❌ Blocked |
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Prerequisites
-
-- Node.js 20+
-- PostgreSQL 16+
-- Redis 7+
-- Docker & Docker Compose (optional)
-
-### 2. Clone & Install
-
 ```bash
-git clone <repo-url>
-cd trading-platform
-
-# Backend
-npm install
-
-# Dashboard
-cd dashboard && npm install && cd ..
-```
-
-### 3. Configure Environment
-
-```bash
+# 1. Extract and setup
 cp .env.example .env
-```
+# Edit .env — Binance API key minimum
 
-Edit `.env` with your settings:
+# 2. Docker (recommended)
+sudo docker compose up -d
 
-```bash
-# Binance API (use testnet for safety)
-BINANCE_API_KEY=your_key
-BINANCE_API_SECRET=your_secret
-BINANCE_TESTNET=true
+# 3. Manual
+npm install && npm run dev          # Backend :3001
+cd dashboard && npm install && npm run dev  # Frontend :3000
 
-# Database
-DB_HOST=localhost
-DB_USER=postgres
-DB_PASSWORD=postgres123
-
-# AI (optional but recommended)
-OPENAI_API_KEY=sk-...
-# or
-GEMINI_API_KEY=...
-AI_PROVIDER=openai
-
-# Telegram (optional)
-TELEGRAM_BOT_TOKEN=...
-TELEGRAM_CHAT_ID=...
-
-# Trading mode: dryrun | live | replay
-TRADING_MODE=dryrun
-```
-
-### 4. Start with Docker (Recommended)
-
-```bash
-docker-compose up -d
-```
-
-- Dashboard: http://localhost:3000
-- API: http://localhost:3001
-- Health: http://localhost:3001/health
-
-### 5. Start Manually
-
-```bash
-# Terminal 1 — Backend
-npm run dev
-
-# Terminal 2 — Dashboard
-cd dashboard && npm run dev
+# 4. One-time CLI auth (free, no API key)
+npm install -g @openai/codex @google/gemini-cli
+codex auth login
+gemini auth login
 ```
 
 ---
 
-## 🔧 Trading Modes
-
-| Mode | Description |
-|------|-------------|
-| `dryrun` | Virtual wallet, simulated fills, fees, slippage & liquidation |
-| `live` | Real Binance Futures orders with SL/TP automation |
-| `replay` | Historical candle-by-candle replay with AI signal analysis |
-
-Set `TRADING_MODE=dryrun` in `.env` before using live mode.
-
----
-
-## 📊 Signal Engine
-
-### Confluence Scoring (Weighted)
-
-| Factor | Score |
-|--------|-------|
-| Whale Activity | +25 |
-| Order Block | +22 |
-| Volume Spike | +20 |
-| Break of Structure | +20 |
-| EMA Bullish Stack | +18 |
-| Breakout | +18 |
-| RSI Bullish Divergence | +15 |
-| Change of Character | +15 |
-| Trend Continuation | +15 |
-| Absorption | +15 |
-| Fake Breakout | **-30** |
-| EMA Bearish Stack | **-18** |
-| Spoofing Detected | **-15** |
-
-Minimum confidence to generate a signal: **70%** (configurable)
-
----
-
-## 🤖 AI Multi-Agent System
-
-Five agents run in **parallel** for every signal:
-
-| Agent | Responsibility |
-|-------|---------------|
-| `VolumeAgent` | Volume behavior, whale activity, absorption |
-| `PatternAgent` | Market structure, BOS, CHOCH, OB, FVG |
-| `IndicatorAgent` | EMA, RSI divergence, MACD, VWAP |
-| `MEVAgent` | Smart money, sandwich detection, front-running |
-| `RiskAgent` | RR validation, SL sizing, volatility |
-
-AI generates:
-- ✅ Signal validation (valid/invalid)
-- 📊 Confidence score per agent
-- 📝 Trade journal narrative
-- ⚠️ Risk flags
-
-> AI can **suggest** a signal is invalid, but it cannot directly override the risk engine or execute orders.
-
----
-
-## 🛡️ Risk Management
-
-| Parameter | Default | Config Key |
-|-----------|---------|-----------|
-| Max Daily Loss | 5% | `MAX_DAILY_LOSS_PERCENT` |
-| Max Open Positions | 3 | `MAX_OPEN_POSITIONS` |
-| Cooldown After Loss | 30 min | `COOLDOWN_AFTER_LOSS_MINUTES` |
-| Min RR Ratio | 1.5 | `RISK_REWARD_MIN` |
-| Max Leverage | 20x | `MAX_LEVERAGE` |
-| Volatility Threshold | 5% | `VOLATILITY_THRESHOLD` |
-
----
-
-## 📡 API Reference
+## 📡 New API Endpoints (v2)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | System health check |
-| `/api/signals` | GET | All latest signals |
-| `/api/signals/:pair` | GET | Signal for specific pair |
-| `/api/signals/evaluate` | POST | Force evaluate signal |
-| `/api/positions` | GET | Open positions |
-| `/api/positions/history` | GET | Trade history |
-| `/api/positions/:id/close` | POST | Close position |
-| `/api/wallet` | GET | Virtual wallet state |
-| `/api/analytics/metrics` | GET | Performance metrics |
-| `/api/analytics/daily-pnl` | GET | Daily PnL data |
-| `/api/risk/state` | GET | Risk manager state |
-| `/api/market/candles/:pair` | GET | OHLCV candles |
-| `/api/market/price/:pair` | GET | Current price |
-| `/api/market/funding/:pair` | GET | Funding rate |
-| `/api/replay/start` | POST | Start replay |
-| `/api/replay/stop` | POST | Stop replay |
-| `/api/ai/analysis` | GET | AI analysis history |
-| `/api/config` | GET | Platform configuration |
+| `/api/regime` | GET | All pair regimes |
+| `/api/regime/:pair` | GET | Analyze specific pair regime |
+| `/api/quality` | GET | Market quality scores |
+| `/api/session` | GET | Current session info |
+| `/api/consensus/:pair` | GET | Run consensus vote |
+| `/api/strategy/mode` | GET/POST | Get/set strategy mode |
+| `/api/strategy/modes` | GET | All mode configs |
+| `/api/frequency` | GET | Frequency & loss streak state |
+| `/api/frequency/reset-cooldown` | POST | Exit loss streak cooldown |
+| `/api/review` | GET | Recent self-review journals |
 
 ---
 
-## 🔔 Telegram Commands
+## 🔔 Telegram Commands (v2)
 
 | Command | Description |
 |---------|-------------|
-| `/status` | Platform status & performance |
-| `/signals` | Latest signals |
-| `/positions` | Open positions |
+| `/status` | Full status: mode, session, streak, wallet |
+| `/regime` | All pair regimes |
+| `/signals` | Active approved signals |
+| `/mode <name>` | Change strategy mode |
 | `/help` | Command list |
 
 ---
 
-## 📈 Dashboard Features
+## ⚠️ Disclaimer
 
-- **Overview** — Wallet, equity, daily PnL chart, risk monitor
-- **Signals** — Live signal feed with confidence meter & AI journal
-- **Positions** — Open positions with PnL, ROE, liquidation price
-- **AI Reasoning** — Agent scores, validation, risk flags
-- **Analytics** — Win rate, profit factor, Sharpe ratio, drawdown
-- **Replay** — Historical backtest with speed control
-
----
-
-## 🔐 Security
-
-- All API keys stored in environment variables
-- Binance testnet mode by default
-- No hardcoded credentials
-- Rate limiting on API requests
-- WebSocket reconnection with exponential backoff
-
----
-
-## ⚠️ Important Disclaimer
-
-This platform is for educational and research purposes.  
-Crypto trading carries significant financial risk.  
-Always test on **testnet/dryrun** before using real funds.  
-The authors are not responsible for financial losses.
-
----
-
-## 🤖 Codex CLI & Gemini CLI Integration
-
-The platform uses **7 agents** running in parallel for every signal:
-
-### Agent Roster
-
-| # | Agent | Type | Requires |
-|---|-------|------|---------|
-| 1 | `VolumeAgent` | Deterministic | Nothing |
-| 2 | `PatternAgent` | Deterministic | Nothing |
-| 3 | `IndicatorAgent` | Deterministic | Nothing |
-| 4 | `MEVAgent` | Deterministic | Nothing |
-| 5 | `RiskAgent` | Deterministic | Nothing |
-| 6 | `CodexCLIAgent` | CLI subprocess | `OPENAI_API_KEY` + Codex CLI |
-| 7 | `GeminiCLIAgent` | CLI subprocess | `GEMINI_API_KEY` + Gemini CLI |
-
-### Installing the CLIs
-
-```bash
-# Codex CLI (OpenAI)
-npm install -g @openai/codex
-
-# Gemini CLI (Google)
-npm install -g @google/gemini-cli
-```
-
-Set your keys in `.env`:
-```bash
-OPENAI_API_KEY=sk-...
-GEMINI_API_KEY=AIza...
-```
-
-Both CLIs are invoked as **child processes** with structured prompts. They respond in a parsed format (`SCORE: / JOURNAL: / RISK:`). If a CLI is not installed, the system automatically falls back to deterministic rule-based analysis — **the platform always runs**.
-
-### Weighted Scoring
-
-```
-Final Score = deterministicAvg × 0.6 + cliAvg × 0.4
-```
-
-### Hard Veto Conditions
-- `RiskAgent` score < 25 → signal blocked
-- Both Codex CLI AND Gemini CLI flag 2+ `RISK:` items → signal blocked
+Educational and research purposes only. Always use testnet/dryrun before live funds. The authors are not responsible for financial losses.

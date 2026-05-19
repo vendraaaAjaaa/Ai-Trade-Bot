@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   # ---- PostgreSQL ----
   postgres:
@@ -55,11 +53,11 @@ services:
     env_file:
       - .env
     environment:
-      DB_HOST: postgres
-      REDIS_HOST: redis
+      DB_HOST: 127.0.0.1
+      REDIS_HOST: 127.0.0.1
       NODE_ENV: production
-    ports:
-      - "3001:3001"
+      NODE_OPTIONS: "--dns-result-order=ipv4first"
+    network_mode: "host"
     volumes:
       - ./logs:/app/logs
     healthcheck:
@@ -67,8 +65,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
-    networks:
-      - trading_net
+      start_period: 15s
 
   # ---- Frontend Dashboard ----
   dashboard:
@@ -80,12 +77,8 @@ services:
     depends_on:
       - backend
     environment:
-      NEXT_PUBLIC_API_URL: http://backend:3001
-      DASHBOARD_API_URL: http://backend:3001
-    ports:
-      - "3000:3000"
-    networks:
-      - trading_net
+      NEXT_PUBLIC_API_URL: http://localhost:3001
+    network_mode: "host"
 
 volumes:
   postgres_data:

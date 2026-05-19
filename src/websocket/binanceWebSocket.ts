@@ -28,8 +28,12 @@ export class BinanceWebSocketService extends EventEmitter {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private reconnectAttempts = 0;
   private pingTimer: NodeJS.Timeout | null = null;
+  private pingTimeout: NodeJS.Timeout | null = null;
   private isConnecting = false;
   private subscriptions: string[] = [];
+  private msgCount = 0;
+  private seenStreams = new Set<string>();
+  private klineCount = 0;
 
   constructor(
     private readonly pairs: TradingPair[],
@@ -56,15 +60,13 @@ export class BinanceWebSocketService extends EventEmitter {
       this.subscriptions.push(`${p}@aggTrade`);
       // Mini ticker (price)
       this.subscriptions.push(`${p}@miniTicker`);
-      // Depth for order book (top 5)
-      this.subscriptions.push(`${p}@depth5@100ms`);
     }
   }
 
   private buildUrl(): string {
     const base = config.binance.testnet ? WS_BASE_TESTNET : WS_BASE;
-    const streams = this.subscriptions.join('/');
-    return `${base}?streams=${streams}`;
+    // Use /ws endpoint instead of /stream?streams= for programmatic subscription
+    return base.replace('/stream', '/ws');
   }
 
   private connect(): void {
@@ -72,22 +74,77 @@ export class BinanceWebSocketService extends EventEmitter {
     this.isConnecting = true;
 
     const url = this.buildUrl();
-    log.info({ url: url.substring(0, 80) + '...' }, 'Connecting to Binance WebSocket');
+    log.info({ url, streams: this.subscriptions.length }, 'Connecting to Binance WebSocket');
 
     this.ws = new WebSocket(url);
 
     this.ws.on('open', () => {
-      log.info('Binance WebSocket connected');
+      log.info('Binance WebSocket connected, sending SUBSCRIBE...');
       this.isConnecting = false;
       this.reconnectAttempts = 0;
+
+      // Subscribe via message instead of URL params
+      const subscribeMsg = {
+        method: 'SUBSCRIBE',
+        params: this.subscriptions,
+        id: 1,
+      };
+      this.ws!.send(JSON.stringify(subscribeMsg));
+      log.info({ params: this.subscriptions }, 'SUBSCRIBE message sent');
+
       this.emit('connected');
       this.startPing();
     });
 
     this.ws.on('message', (data: WebSocket.RawData) => {
       try {
-        const msg = JSON.parse(data.toString()) as { stream: string; data: unknown };
-        this.handleMessage(msg.stream, msg.data);
+        this.msgCount++;
+        const raw = data.toString();
+        if (this.msgCount <= 3) {
+          log.info({ raw: raw.substring(0, 300), msgCount: this.msgCount }, 'RAW WebSocket message');
+        }
+        if (this.msgCount % 500 === 0) {
+          log.info({ totalMessages: this.msgCount, uniqueStreams: [...this.seenStreams], klineCount: this.klineCount }, 'WebSocket heartbeat');
+        }
+
+        const msg = JSON.parse(raw);
+
+        // Handle SUBSCRIBE response
+        if (msg.id && msg.result !== undefined) {
+          log.info({ id: msg.id, result: msg.result }, 'SUBSCRIBE response received');
+          return;
+        }
+
+        // Handle combined stream format: { stream: "...", data: {...} }
+        if (msg.stream && msg.data) {
+          if (!this.seenStreams.has(msg.stream)) {
+            this.seenStreams.add(msg.stream);
+            log.info({ stream: msg.stream }, 'New stream type discovered');
+          }
+          this.handleMessage(msg.stream, msg.data);
+          return;
+        }
+
+        // Handle direct /ws format: { e: "kline", s: "BTCUSDT", ... }
+        if (msg.e) {
+          const symbol = (msg.s as string)?.toLowerCase() ?? '';
+          let streamName = '';
+          if (msg.e === 'kline' && msg.k?.i) {
+            streamName = `${symbol}@kline_${msg.k.i}`;
+            this.handleMessage(streamName, msg);
+          } else if (msg.e === 'aggTrade') {
+            streamName = `${symbol}@aggTrade`;
+            this.handleMessage(streamName, msg);
+          } else if (msg.e === '24hrMiniTicker') {
+            streamName = `${symbol}@miniTicker`;
+            this.handleMessage(streamName, msg);
+          }
+          if (streamName && !this.seenStreams.has(streamName)) {
+            this.seenStreams.add(streamName);
+            log.info({ stream: streamName }, 'New stream type discovered');
+          }
+          return;
+        }
       } catch (err) {
         log.warn({ err }, 'Failed to parse WebSocket message');
       }
@@ -103,11 +160,19 @@ export class BinanceWebSocketService extends EventEmitter {
       log.warn({ code, reason: reason.toString() }, 'WebSocket closed');
       this.isConnecting = false;
       this.stopPing();
+      if (this.pingTimeout) {
+        clearTimeout(this.pingTimeout);
+        this.pingTimeout = null;
+      }
       this.scheduleReconnect();
     });
 
     this.ws.on('pong', () => {
       log.debug('WebSocket pong received');
+      if (this.pingTimeout) {
+        clearTimeout(this.pingTimeout);
+        this.pingTimeout = null;
+      }
     });
   }
 
@@ -115,10 +180,14 @@ export class BinanceWebSocketService extends EventEmitter {
     const [symbol, streamType] = stream.split('@');
     const pair = symbol.toUpperCase() as TradingPair;
 
-    if (streamType.startsWith('kline_')) {
+    if (streamType?.startsWith('kline_')) {
+      this.klineCount++;
       const tf = streamType.replace('kline_', '') as Timeframe;
       const payload = (data as { k: KlinePayload }).k;
       const candle = this.parseCandle(payload);
+      if (payload.x) {
+        log.info({ pair, tf, close: candle.close }, '🕯️ KLINE CLOSED — emitting candle event');
+      }
       this.emit('candle', { pair, timeframe: tf, candle, isClosed: payload.x });
       if (payload.x) {
         this.cacheCandle(pair, tf, candle);
@@ -193,6 +262,10 @@ export class BinanceWebSocketService extends EventEmitter {
     this.pingTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         this.ws.ping();
+        this.pingTimeout = setTimeout(() => {
+          log.warn('WebSocket ping timeout — connection is dead (zombie), terminating...');
+          this.ws?.terminate();
+        }, 10000);
       }
     }, config.websocket.pingIntervalMs);
   }
@@ -205,22 +278,28 @@ export class BinanceWebSocketService extends EventEmitter {
   }
 
   private scheduleReconnect(): void {
-    if (this.reconnectAttempts >= config.websocket.maxReconnectAttempts) {
-      log.error('Max WebSocket reconnect attempts reached');
-      this.emit('fatal_error', new Error('Max reconnect attempts exceeded'));
-      return;
-    }
+    // Never give up reconnecting — use exponential backoff with cap
     const delay = Math.min(
-      config.websocket.reconnectDelayMs * Math.pow(1.5, this.reconnectAttempts),
-      30000,
+      config.websocket.reconnectDelayMs * Math.pow(1.5, Math.min(this.reconnectAttempts, 20)),
+      60000, // max 60 seconds between attempts
     );
     this.reconnectAttempts++;
-    log.info({ attempt: this.reconnectAttempts, delay }, 'Scheduling WebSocket reconnect');
+
+    if (this.reconnectAttempts % 10 === 0) {
+      log.warn({ attempt: this.reconnectAttempts, delay }, 'WebSocket still reconnecting — persistent connection issues');
+    } else {
+      log.info({ attempt: this.reconnectAttempts, delay }, 'Scheduling WebSocket reconnect');
+    }
+
     this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
 
   stop(): void {
     this.stopPing();
+    if (this.pingTimeout) {
+      clearTimeout(this.pingTimeout);
+      this.pingTimeout = null;
+    }
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.ws) {
       this.ws.removeAllListeners();
