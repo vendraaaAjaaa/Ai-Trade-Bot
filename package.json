@@ -2,6 +2,7 @@
   "name": "ai-trading-platform",
   "version": "1.0.0",
   "description": "AI Agentic Trading Automation Platform",
+  "license": "MIT",
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
