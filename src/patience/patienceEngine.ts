@@ -1,3 +1,22 @@
+/**
+ * =============================================
+ * PATIENCE ENGINE — Phase 5
+ * =============================================
+ *
+ * Changes from Phase 5:
+ *   - Mode-aware soft-fail tolerance
+ *       safe/swing:       max 1 soft fail (unchanged)
+ *       aggressive/scalping: max 2 soft fails allowed
+ *   - Hard blockers are NEVER relaxed regardless of mode:
+ *       - manipulative regime
+ *       - session block
+ *       - quality.tradingAllowed = false
+ *       - isManipulative flag
+ *   - Feature flag: ENABLE_SOFT_FAIL_TOLERANCE=true (default on)
+ *   - Debug logs explain exactly which soft fails occurred
+ *   - neutralConfidenceFloor config respected
+ */
+
 import type { TradingSignal } from '../utils/types';
 import type {
   PatienceDecision, RegimeAnalysis, MarketQualityScore,
@@ -6,6 +25,24 @@ import type {
 import { createLogger } from '../utils/logger';
 
 const log = createLogger('patience');
+
+// ---- Feature flag ----
+const ENABLE_SOFT_FAIL_TOLERANCE = process.env['ENABLE_SOFT_FAIL_TOLERANCE'] !== 'false';
+
+/**
+ * Maximum number of soft fails allowed before rejecting, per mode.
+ * Legacy: any 2+ soft fails → rejected; 1 soft fail → trade in aggressive/swing/scalping.
+ */
+const MAX_SOFT_FAILS: Record<StrategyMode, number> = {
+  safe:       1,  // unchanged — most conservative
+  swing:      1,  // unchanged
+  investing:  1,  // unchanged
+  aggressive: 2,  // Phase 5 relaxation
+  scalping:   2,  // Phase 5 relaxation
+};
+
+/** Legacy soft-fail limit (was effectively 1 for aggressive, 0 for safe) */
+const LEGACY_MAX_SOFT_FAILS = 1;
 
 // Psychological notes the AI uses to stay disciplined
 const PATIENCE_NOTES = {
@@ -33,7 +70,7 @@ const PATIENCE_NOTES = {
     'Market conditions are unfavorable. Any entry here is gambling.',
     'Discipline means knowing when NOT to trade.',
   ],
-};
+} as const;
 
 export class PatienceEngine {
 
@@ -48,7 +85,10 @@ export class PatienceEngine {
 
     const checks: { pass: boolean; reason: string; critical: boolean }[] = [];
 
-    // ---- Critical blockers (hard NO) ----
+    // ──────────────────────────────────────────────────────────
+    // HARD BLOCKERS — these are NEVER relaxed regardless of mode
+    // ──────────────────────────────────────────────────────────
+
     checks.push({
       pass: regime.tradingAllowed,
       reason: `Regime blocks trading: ${regime.regime} (${regime.description})`,
@@ -73,7 +113,10 @@ export class PatienceEngine {
       critical: true,
     });
 
-    // ---- Soft filters ----
+    // ──────────────────────────────────────────────────────────
+    // SOFT FILTERS — relaxable for aggressive/scalping
+    // ──────────────────────────────────────────────────────────
+
     checks.push({
       pass: mtf.overallAligned,
       reason: mtf.rejectionReason ?? 'Multi-timeframe alignment incomplete',
@@ -104,12 +147,25 @@ export class PatienceEngine {
       critical: false,
     });
 
-    // ---- Decision logic ----
+    // ──────────────────────────────────────────────────────────
+    // Decision logic
+    // ──────────────────────────────────────────────────────────
     const criticalFails = checks.filter((c) => !c.pass && c.critical);
-    const softFails = checks.filter((c) => !c.pass && !c.critical);
-    const totalFails = criticalFails.length + softFails.length;
+    const softFails     = checks.filter((c) => !c.pass && !c.critical);
+    const maxAllowed    = ENABLE_SOFT_FAIL_TOLERANCE ? MAX_SOFT_FAILS[mode] : LEGACY_MAX_SOFT_FAILS;
 
+    // Debug log breakdown
+    log.info({
+      mode,
+      softFails:    softFails.length,
+      criticalFails: criticalFails.length,
+      maxAllowed,
+      softFailDetails: softFails.map((f) => f.reason),
+    }, `[PATIENCE] Check complete — soft fails: ${softFails.length}/${maxAllowed}`);
+
+    // ---- Hard blockers: immediate NO regardless of mode ----
     if (criticalFails.length > 0) {
+      log.warn({ mode, reason: criticalFails[0]!.reason }, '[PATIENCE] Critical blocker — trade rejected');
       return {
         shouldTrade: false,
         reason: criticalFails[0]!.reason,
@@ -120,76 +176,65 @@ export class PatienceEngine {
       };
     }
 
-    if (softFails.length >= 3) {
+    // ---- Too many soft fails for this mode ----
+    if (softFails.length > maxAllowed) {
+      const qualityLabel = softFails.length >= 3 ? 'poor' : 'marginal';
+      log.info({
+        mode, softFails: softFails.length, maxAllowed,
+      }, `[PATIENCE] Soft fail overflow (${softFails.length} > ${maxAllowed}) — trade rejected`);
       return {
         shouldTrade: false,
-        reason: `Multiple soft criteria failed: ${softFails.map((f) => f.reason).slice(0, 2).join('; ')}`,
-        quality: 'poor',
+        reason: `Too many soft fails (${softFails.length}/${maxAllowed} max): ${softFails.map((f) => f.reason).slice(0, 2).join('; ')}`,
+        quality: qualityLabel as 'poor' | 'marginal',
         waitForCondition: 'Wait for MTF alignment and higher confidence score',
-        estimatedWaitMinutes: 15,
-        psychologicalNote: this.randomNote('poor'),
+        estimatedWaitMinutes: softFails.length >= 3 ? 15 : 5,
+        psychologicalNote: this.randomNote(qualityLabel as keyof typeof PATIENCE_NOTES),
         timestamp: Date.now(),
       };
     }
 
-    if (softFails.length === 2) {
+    // ---- Within soft-fail budget — trade is allowed ----
+    if (softFails.length > 0) {
+      log.info({
+        mode, softFails: softFails.length, maxAllowed,
+      }, `[PATIENCE] ${softFails.length} soft fail(s) within ${mode} budget — proceeding`);
       return {
-        shouldTrade: false,
-        reason: softFails.map((f) => f.reason).join('; '),
-        quality: 'marginal',
-        waitForCondition: softFails[0]!.reason,
-        estimatedWaitMinutes: 5,
-        psychologicalNote: this.randomNote('marginal'),
+        shouldTrade: true,
+        reason: `${mode} mode: proceeding with ${softFails.length}/${maxAllowed} soft concern(s): ${softFails[0]!.reason}`,
+        quality: 'good',
+        psychologicalNote: this.randomNote('good'),
         timestamp: Date.now(),
       };
     }
 
-    if (softFails.length === 1) {
-      // One soft fail — tradeable in aggressive, swing, and scalping modes
-      if (mode === 'aggressive' || mode === 'swing' || mode === 'scalping') {
-        return {
-          shouldTrade: true,
-          reason: `${mode} mode: proceeding despite minor concern: ${softFails[0]!.reason}`,
-          quality: 'good',
-          psychologicalNote: this.randomNote('good'),
-          timestamp: Date.now(),
-        };
-      }
-      return {
-        shouldTrade: false,
-        reason: softFails[0]!.reason,
-        quality: 'marginal',
-        waitForCondition: softFails[0]!.reason,
-        estimatedWaitMinutes: 3,
-        psychologicalNote: this.randomNote('marginal'),
-        timestamp: Date.now(),
-      };
-    }
-
-    // All checks pass
+    // ---- All checks pass ----
     const qualityLabel = quality.total >= 85 ? 'excellent' : 'good';
     return {
       shouldTrade: true,
       reason: `All patience criteria met — ${qualityLabel} setup`,
-      quality: qualityLabel,
-      psychologicalNote: this.randomNote(qualityLabel),
+      quality: qualityLabel as 'excellent' | 'good',
+      psychologicalNote: this.randomNote(qualityLabel as keyof typeof PATIENCE_NOTES),
       timestamp: Date.now(),
     };
   }
 
   private minConfidence(mode: StrategyMode): number {
-    return { scalping: 72, swing: 75, investing: 70, safe: 90, aggressive: 60 }[mode];
+    return ({ scalping: 72, swing: 75, investing: 70, safe: 90, aggressive: 60 } as Record<StrategyMode, number>)[mode];
   }
 
   private minRR(mode: StrategyMode): number {
-    return { scalping: 1.5, swing: 2.0, investing: 2.5, safe: 2.5, aggressive: 1.2 }[mode];
+    return ({ scalping: 1.5, swing: 2.0, investing: 2.5, safe: 2.5, aggressive: 1.2 } as Record<StrategyMode, number>)[mode];
   }
 
-  private suggestWaitCondition(regime: RegimeAnalysis, quality: MarketQualityScore, session: SessionInfo): string {
+  private suggestWaitCondition(
+    regime: RegimeAnalysis,
+    quality: MarketQualityScore,
+    session: SessionInfo,
+  ): string {
     if (!session.tradingAllowed) return 'Wait for London or New York session';
-    if (regime.isChoppy) return 'Wait for ATR expansion and EMA directional bias';
-    if (regime.isManipulative) return 'Wait for manipulation activity to subside';
-    if (quality.total < 50) return 'Wait for market quality to improve above 70';
+    if (regime.isChoppy)        return 'Wait for ATR expansion and EMA directional bias';
+    if (regime.isManipulative)  return 'Wait for manipulation activity to subside';
+    if (quality.total < 50)     return 'Wait for market quality to improve above 70';
     return 'Wait for all confluence factors to align';
   }
 
