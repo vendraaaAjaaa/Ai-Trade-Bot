@@ -7,6 +7,8 @@
  *   - Live execution returns explicit status codes for protection and emergency-close outcomes.
  *   - Binance orders use exchange filters for quantity and price formatting.
  *   - Failed SL/TP creation triggers a reduce-only emergency close attempt.
+ *   - Phase 9 reconciles market fills from exchange data and trips a kill switch
+ *     when emergency close fails.
  *
  * Safety preserved:
  *   - riskManager.assessSignal() remains mandatory before every live order.
@@ -23,7 +25,10 @@ import { createLogger } from '../../utils/logger';
 import { riskManager } from '../../risk/riskManager';
 import { db } from '../../database/connection';
 import { binanceFilterService, BinanceFilterService } from '../../exchange/binanceFilters';
+import { liveCircuitBreaker } from './liveCircuitBreaker';
+import { operatorAlertService, type OperatorAlertService } from '../../alerts/operatorAlert';
 import type { TradingSignal, Position, TradingPair, OrderSide, RiskAssessment } from '../../utils/types';
+import type { LiveCircuitBreaker, LiveCircuitBreakerState, LiveCircuitBreakerTripInput } from './liveCircuitBreaker';
 
 const log = createLogger('live-executor');
 
@@ -58,12 +63,23 @@ interface LiveRiskManager {
   onPositionOpened(): Promise<void>;
 }
 
+export interface ReconciledFill {
+  orderId?: string;
+  avgPrice: number;
+  executedQty: number;
+  status?: string;
+  quantityDiff: number;
+  raw: BinanceApiResponse;
+}
+
 export interface LiveExecutorOptions {
   filterService?: BinanceFilterService;
   signedRequest?: SignedRequestFn;
   risk?: LiveRiskManager;
   persistPosition?: (position: Position) => Promise<void>;
   baseUrl?: string;
+  circuitBreaker?: Pick<LiveCircuitBreaker, 'assertCanTrade' | 'trip'>;
+  alertService?: OperatorAlertService;
 }
 
 export class LiveExecutor extends EventEmitter {
@@ -72,6 +88,8 @@ export class LiveExecutor extends EventEmitter {
   private readonly signedRequestOverride?: SignedRequestFn;
   private readonly risk: LiveRiskManager;
   private readonly persistPositionOverride?: (position: Position) => Promise<void>;
+  private readonly circuitBreaker: Pick<LiveCircuitBreaker, 'assertCanTrade' | 'trip'>;
+  private readonly alertService: OperatorAlertService;
 
   constructor(options: LiveExecutorOptions = {}) {
     super();
@@ -82,12 +100,24 @@ export class LiveExecutor extends EventEmitter {
     this.signedRequestOverride = options.signedRequest;
     this.risk = options.risk ?? riskManager;
     this.persistPositionOverride = options.persistPosition;
+    this.circuitBreaker = options.circuitBreaker ?? liveCircuitBreaker;
+    this.alertService = options.alertService ?? operatorAlertService;
   }
 
   async executeSignal(signal: TradingSignal, balance: number): Promise<LiveExecutionResult> {
     if (config.trading.mode !== 'live') {
       log.warn('LiveExecutor called but mode is not live');
       return { status: 'EXECUTION_FAILED', position: null, reason: 'Trading mode is not live' };
+    }
+
+    const breaker = await this.canTradeWithCircuitBreaker();
+    if (!breaker.allowed) {
+      log.error({ state: breaker.state, pair: signal.pair }, 'Live: Trade rejected by active circuit breaker');
+      return {
+        status: 'EXECUTION_FAILED',
+        position: null,
+        reason: `Live circuit breaker active: ${breaker.state.reason}`,
+      };
     }
 
     const risk = await this.risk.assessSignal(signal, balance);
@@ -106,15 +136,51 @@ export class LiveExecutor extends EventEmitter {
       await this.setLeverage(signal.pair, risk.leverage);
 
       const order = await this.placeMarketOrder(signal.pair, orderSide, normalized.quantityText);
-      const filledPrice = this.parseFilledPrice(order, signal.entry);
       const exchangeOrderId = this.stringField(order, 'orderId');
+      let fill: ReconciledFill;
+
+      try {
+        fill = await this.reconcileFilledOrder(signal.pair, order, normalized.quantity);
+      } catch (fillError) {
+        log.error({
+          err: fillError,
+          pair: signal.pair,
+          direction: signal.direction,
+          exchangeOrderId,
+        }, 'CRITICAL: Live fill reconciliation failed after market order; attempting emergency close');
+
+        const emergency = await this.emergencyClose(signal.pair, exitSide, normalized.quantity, signal.entry);
+        if (!emergency.success) {
+          return this.handleEmergencyCloseFailed({
+            reason: 'Fill reconciliation failed and emergency close failed',
+            pair: signal.pair,
+            direction: signal.direction,
+            quantity: normalized.quantity,
+            exchangeOrderId,
+            lastErrorMessage: emergency.errorMessage ?? this.errorMessage(fillError),
+          });
+        }
+
+        await this.cancelOpenOrders(signal.pair).catch((cancelError: unknown) => {
+          log.error({ err: cancelError, pair: signal.pair }, 'Live: Failed to cancel orphan orders after fill reconciliation emergency close');
+        });
+        return {
+          status: 'EXECUTION_FAILED',
+          position: null,
+          reason: 'Fill reconciliation failed; position was emergency closed',
+          exchangeOrderId,
+        };
+      }
+
+      const filledPrice = fill.avgPrice;
+      const executedQuantity = fill.executedQty;
 
       try {
         await this.placeSLTPOrders(
           signal.pair,
           signal.direction,
           exitSide,
-          normalized.quantity,
+          executedQuantity,
           filledPrice,
           signal.stopLoss,
           signal.takeProfit,
@@ -127,8 +193,8 @@ export class LiveExecutor extends EventEmitter {
           exchangeOrderId,
         }, 'CRITICAL: Live protective order placement failed; attempting emergency close');
 
-        const emergencyClosed = await this.emergencyClose(signal.pair, exitSide, normalized.quantity, filledPrice);
-        if (emergencyClosed) {
+        const emergency = await this.emergencyClose(signal.pair, exitSide, executedQuantity, filledPrice);
+        if (emergency.success) {
           await this.cancelOpenOrders(signal.pair).catch((cancelError: unknown) => {
             log.error({ err: cancelError, pair: signal.pair }, 'Live: Failed to cancel orphan orders after emergency close');
           });
@@ -140,12 +206,14 @@ export class LiveExecutor extends EventEmitter {
           };
         }
 
-        return {
-          status: 'EMERGENCY_CLOSE_FAILED',
-          position: null,
+        return this.handleEmergencyCloseFailed({
           reason: 'Protective order placement failed and emergency close failed',
+          pair: signal.pair,
+          direction: signal.direction,
+          quantity: executedQuantity,
           exchangeOrderId,
-        };
+          lastErrorMessage: emergency.errorMessage ?? this.errorMessage(protectionError),
+        });
       }
 
       const position: Position = {
@@ -154,9 +222,9 @@ export class LiveExecutor extends EventEmitter {
         direction: signal.direction,
         entryPrice: filledPrice,
         currentPrice: filledPrice,
-        quantity: normalized.quantity,
+        quantity: executedQuantity,
         leverage: risk.leverage,
-        margin: (normalized.quantity * filledPrice) / risk.leverage,
+        margin: (executedQuantity * filledPrice) / risk.leverage,
         unrealizedPnl: 0,
         realizedPnl: 0,
         stopLoss: signal.stopLoss,
@@ -179,7 +247,7 @@ export class LiveExecutor extends EventEmitter {
         pair: signal.pair,
         direction: signal.direction,
         entry: filledPrice,
-        qty: normalized.quantity,
+        qty: executedQuantity,
       }, 'Live: Position opened with SL/TP protection');
 
       this.emit('position_opened', position);
@@ -195,6 +263,27 @@ export class LiveExecutor extends EventEmitter {
       symbol: pair,
       leverage: leverage.toString(),
     });
+  }
+
+  async reconcileFilledOrder(pair: TradingPair, order: BinanceApiResponse, requestedQuantity: number): Promise<ReconciledFill> {
+    const immediate = this.parseFill(order, requestedQuantity);
+    if (immediate) return immediate;
+
+    const orderId = this.stringField(order, 'orderId');
+    if (!orderId) {
+      throw new Error('Market order response missing fill data and orderId');
+    }
+
+    const queried = await this.signedRequest('GET', '/fapi/v1/order', {
+      symbol: pair,
+      orderId,
+    });
+    const reconciled = this.parseFill(queried, requestedQuantity);
+    if (!reconciled) {
+      throw new Error('Queried order response missing usable fill data');
+    }
+
+    return reconciled;
   }
 
   private async placeMarketOrder(pair: TradingPair, side: OrderSide, quantity: string): Promise<BinanceApiResponse> {
@@ -261,7 +350,7 @@ export class LiveExecutor extends EventEmitter {
     return Number(usdtAsset?.availableBalance ?? '0');
   }
 
-  private async emergencyClose(pair: TradingPair, side: OrderSide, quantity: number, referencePrice: number): Promise<boolean> {
+  private async emergencyClose(pair: TradingPair, side: OrderSide, quantity: number, referencePrice: number): Promise<{ success: boolean; errorMessage?: string }> {
     try {
       const normalized = await this.filterService.normalizeReduceOnlyQuantity(pair, quantity, referencePrice);
       await this.signedRequest('POST', '/fapi/v1/order', {
@@ -273,11 +362,48 @@ export class LiveExecutor extends EventEmitter {
         newOrderRespType: 'RESULT',
       });
       log.error({ pair, side, quantity: normalized.quantityText }, 'Live: Emergency reduce-only close succeeded');
-      return true;
+      return { success: true };
     } catch (err) {
       log.error({ err, pair, side }, 'CRITICAL: Live emergency reduce-only close failed');
-      return false;
+      return { success: false, errorMessage: this.errorMessage(err) };
     }
+  }
+
+  private async canTradeWithCircuitBreaker(): Promise<{ allowed: boolean; state: LiveCircuitBreakerState }> {
+    try {
+      return this.circuitBreaker.assertCanTrade();
+    } catch (err) {
+      const state: LiveCircuitBreakerState = {
+        active: true,
+        reason: 'Circuit breaker check failed',
+        timestamp: Date.now(),
+        lastErrorMessage: this.errorMessage(err),
+      };
+      return { allowed: false, state };
+    }
+  }
+
+  private async handleEmergencyCloseFailed(input: LiveCircuitBreakerTripInput): Promise<LiveExecutionResult> {
+    const state = await this.circuitBreaker.trip(input);
+    try {
+      await this.alertService.sendEmergencyCloseFailed({
+        pair: input.pair,
+        direction: input.direction,
+        quantity: input.quantity,
+        exchangeOrderId: input.exchangeOrderId,
+        timestamp: state.timestamp,
+        lastErrorMessage: input.lastErrorMessage,
+      });
+    } catch (alertError) {
+      log.error({ err: alertError, pair: input.pair, exchangeOrderId: input.exchangeOrderId }, 'Emergency-close alert failed; breaker remains active');
+    }
+
+    return {
+      status: 'EMERGENCY_CLOSE_FAILED',
+      position: null,
+      reason: input.reason,
+      exchangeOrderId: input.exchangeOrderId,
+    };
   }
 
   private async cancelOpenOrders(pair: TradingPair): Promise<void> {
@@ -343,15 +469,29 @@ export class LiveExecutor extends EventEmitter {
     ).catch((err: unknown) => log.warn({ err }, 'Failed to persist live position'));
   }
 
-  private parseFilledPrice(order: BinanceApiResponse, fallbackPrice: number): number {
+  private parseFill(order: BinanceApiResponse, requestedQuantity: number): ReconciledFill | null {
+    const executedQty = this.numberField(order, 'executedQty');
+    if (!Number.isFinite(executedQty) || executedQty <= 0) return null;
+
     const avgPrice = this.numberField(order, 'avgPrice');
-    if (avgPrice > 0) return avgPrice;
+    const cumQuote = this.numberField(order, 'cumQuote');
+    const computedAvgPrice = avgPrice > 0 ? avgPrice : cumQuote > 0 ? cumQuote / executedQty : 0;
+    if (!Number.isFinite(computedAvgPrice) || computedAvgPrice <= 0) return null;
 
-    const price = this.numberField(order, 'price');
-    if (price > 0) return price;
+    const quantityDiff = Math.abs(executedQty - requestedQuantity);
+    const tolerance = Math.max(1e-8, requestedQuantity * 0.001);
+    if (quantityDiff > tolerance) {
+      log.warn({ requestedQuantity, executedQty, quantityDiff }, 'Live: Executed quantity differs materially from requested quantity; using exchange executed quantity');
+    }
 
-    log.warn({ fallbackPrice }, 'Live: Exchange order did not include fill price; using signal entry for accounting');
-    return fallbackPrice;
+    return {
+      orderId: this.stringField(order, 'orderId'),
+      avgPrice: computedAvgPrice,
+      executedQty,
+      status: this.stringField(order, 'status'),
+      quantityDiff,
+      raw: order,
+    };
   }
 
   private numberField(value: BinanceApiResponse, key: string): number {

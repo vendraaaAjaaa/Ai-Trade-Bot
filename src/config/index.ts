@@ -8,6 +8,7 @@
  *     and LIVE_TRADING_CONFIRMATION before real-funds endpoints are allowed.
  *   - Dashboard API token, CORS allowlist, and rate-limit settings are validated here.
  *   - Numeric risk and runtime settings are bounded with clear fail-closed errors.
+ *   - Phase 9 adds explicit max-position-notional and dry-run restore controls.
  *
  * Safety preserved:
  *   - Dry-run remains the default trading mode.
@@ -96,11 +97,14 @@ const configSchema = z.object({
     leverage: z.number().int().min(1).max(20).default(10),
     feeRate: z.number().finite().min(0).max(0.01).default(0.0004),
     slippage: z.number().finite().min(0).max(0.05).default(0.0002),
+    restoreOpenPositions: z.boolean().default(true),
+    strictRestore: z.boolean().default(false),
   }),
   risk: z.object({
     maxDailyLossPercent: z.number().finite().positive().max(50).default(5),
     maxOpenPositions: z.number().int().min(1).max(20).default(3),
     maxPositionSizePercent: z.number().finite().positive().max(10).default(10),
+    maxPositionNotionalPercent: z.number().finite().positive().max(100).default(10),
     riskRewardMin: z.number().finite().min(1).max(10).default(1.5),
     cooldownAfterLossMinutes: z.number().int().min(1).max(1440).default(30),
     maxLeverage: z.number().int().min(1).max(20).default(20),
@@ -120,6 +124,7 @@ const configSchema = z.object({
   }),
   dashboard: z.object({
     apiToken: z.string().default(''),
+    backendApiUrl: z.string().url().default('http://localhost:3001'),
     corsOrigins: z.array(z.string().url()).nonempty(),
     rateLimitWindowMs: z.number().int().min(1000).max(3600000).default(60000),
     rateLimitMax: z.number().int().min(1).max(10000).default(120),
@@ -329,11 +334,14 @@ export function parseConfig(env: Env = process.env): AppConfig {
       leverage: envNumber(env, 'DRY_RUN_LEVERAGE', 10),
       feeRate: envNumber(env, 'DRY_RUN_FEE_RATE', 0.0004),
       slippage: envNumber(env, 'DRY_RUN_SLIPPAGE', 0.0002),
+      restoreOpenPositions: envBoolean(env, 'DRYRUN_RESTORE_OPEN_POSITIONS', true),
+      strictRestore: envBoolean(env, 'DRYRUN_STRICT_RESTORE', false),
     },
     risk: {
       maxDailyLossPercent: envNumber(env, 'MAX_DAILY_LOSS_PERCENT', 5),
       maxOpenPositions: envNumber(env, 'MAX_OPEN_POSITIONS', 3),
       maxPositionSizePercent: envNumber(env, 'MAX_POSITION_SIZE_PERCENT', 10),
+      maxPositionNotionalPercent: envNumber(env, 'MAX_POSITION_NOTIONAL_PERCENT', 10),
       riskRewardMin: envNumber(env, 'RISK_REWARD_MIN', 1.5),
       cooldownAfterLossMinutes: envNumber(env, 'COOLDOWN_AFTER_LOSS_MINUTES', 30),
       maxLeverage: envNumber(env, 'MAX_LEVERAGE', 20),
@@ -353,6 +361,7 @@ export function parseConfig(env: Env = process.env): AppConfig {
     },
     dashboard: {
       apiToken: dashboardToken,
+      backendApiUrl: envString(env, 'BACKEND_API_URL', envString(env, 'DASHBOARD_API_URL', 'http://localhost:3001')),
       corsOrigins: envCsv(env, 'CORS_ORIGINS', ['http://localhost:3000', 'http://127.0.0.1:3000']),
       rateLimitWindowMs: envNumber(env, 'DASHBOARD_RATE_LIMIT_WINDOW_MS', 60000),
       rateLimitMax: envNumber(env, 'DASHBOARD_RATE_LIMIT_MAX', 120),

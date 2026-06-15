@@ -11,6 +11,7 @@ import { strategyManager } from '../strategy/strategyModes';
 import type { TradingSignal, Position } from '../utils/types';
 import type { RegimeAnalysis, NoTradeDecision, LossStreakState } from '../utils/types2';
 import type { EnrichedSignal } from '../signals/signalEngine';
+import type { EmergencyCloseFailureAlert } from '../alerts/operatorAlert';
 
 const log = createLogger('telegram-v2');
 
@@ -196,6 +197,19 @@ export class TelegramNotifier {
       `Entry: \`${position.entryPrice.toFixed(4)}\` → Exit: \`${position.currentPrice.toFixed(4)}\`\n` +
       `PnL: \`${pnl >= 0 ? '+' : ''}$${pnl.toFixed(4)}\`\n` +
       `ROE: \`${position.roe.toFixed(2)}%\``, true);
+  }
+
+  async sendEmergencyCloseFailed(event: EmergencyCloseFailureAlert): Promise<void> {
+    await this.sendMessage(
+      `🚨 *CRITICAL: EMERGENCY_CLOSE_FAILED*\n\n` +
+      `Manual exchange/account inspection required immediately.\n` +
+      `Live trading has been disabled by circuit breaker.\n\n` +
+      `Pair: \`${event.pair}\`\n` +
+      `Direction: \`${event.direction}\`\n` +
+      `Quantity: \`${event.quantity}\`\n` +
+      `Order ID: \`${event.exchangeOrderId ?? 'unknown'}\`\n` +
+      `Timestamp: \`${new Date(event.timestamp).toISOString()}\`\n` +
+      `Last error: \`${event.lastErrorMessage ?? 'unknown'}\``, true);
   }
 
   async sendDailyReport(): Promise<void> {

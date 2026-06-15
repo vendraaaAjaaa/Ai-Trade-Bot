@@ -6,6 +6,10 @@ describe('configuration safety validation', () => {
 
     expect(cfg.trading.mode).toBe('dryrun');
     expect(cfg.binance.testnet).toBe(true);
+    expect(cfg.risk.maxPositionNotionalPercent).toBe(10);
+    expect(cfg.dryRun.restoreOpenPositions).toBe(true);
+    expect(cfg.dryRun.strictRestore).toBe(false);
+    expect(cfg.dashboard.backendApiUrl).toBe('http://localhost:3001');
   });
 
   it('rejects live mode when BINANCE_TESTNET is missing', () => {
@@ -80,5 +84,30 @@ describe('configuration safety validation', () => {
       DEFAULT_LEVERAGE: '20',
       MAX_LEVERAGE: '5',
     })).toThrow(/DEFAULT_LEVERAGE/);
+
+    expect(() => parseConfig({
+      NODE_ENV: 'test',
+      MAX_POSITION_NOTIONAL_PERCENT: '0',
+    })).toThrow(/maxPositionNotionalPercent/);
+
+    expect(() => parseConfig({
+      NODE_ENV: 'test',
+      MAX_POSITION_NOTIONAL_PERCENT: '101',
+    })).toThrow(/maxPositionNotionalPercent/);
+  });
+
+  it('parses server-only dashboard backend URL and dry-run restore flags', () => {
+    const cfg = parseConfig({
+      NODE_ENV: 'test',
+      BACKEND_API_URL: 'http://backend:3001',
+      DRYRUN_RESTORE_OPEN_POSITIONS: 'false',
+      DRYRUN_STRICT_RESTORE: 'true',
+      MAX_POSITION_NOTIONAL_PERCENT: '25',
+    });
+
+    expect(cfg.dashboard.backendApiUrl).toBe('http://backend:3001');
+    expect(cfg.dryRun.restoreOpenPositions).toBe(false);
+    expect(cfg.dryRun.strictRestore).toBe(true);
+    expect(cfg.risk.maxPositionNotionalPercent).toBe(25);
   });
 });

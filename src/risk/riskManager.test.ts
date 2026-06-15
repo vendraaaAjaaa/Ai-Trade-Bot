@@ -92,6 +92,7 @@ function resetRiskConfig(): void {
   risk.maxDailyLossPercent = 5;
   risk.maxOpenPositions = 3;
   risk.maxPositionSizePercent = 10;
+  risk.maxPositionNotionalPercent = 10;
   risk.riskRewardMin = 1.5;
   risk.cooldownAfterLossMinutes = 30;
   risk.maxLeverage = 20;
@@ -145,14 +146,27 @@ describe('RiskManager fail-closed checks', () => {
     expect(result.reason).toMatch(/Invalid leverage/);
   });
 
-  it('caps position size at 10 percent notional of balance', async () => {
+  it('caps position size at configured notional percent of balance', async () => {
+    config.risk.maxPositionNotionalPercent = 5;
     const manager = new RiskManager();
 
     const result = await manager.assessSignal(makeSignal({ entry: 1000, stopLoss: 999 }), 10000);
 
     expect(result.isAllowed).toBe(true);
-    expect(result.positionSize).toBeCloseTo(1);
-    expect(result.positionSize * 1000).toBeLessThanOrEqual(1000);
+    expect(result.positionSize).toBeCloseTo(0.5);
+    expect(result.positionSize * 1000).toBeLessThanOrEqual(500);
+  });
+
+  it('allows risk sizing below the configured notional cap', async () => {
+    config.risk.maxPositionSizePercent = 1;
+    config.risk.maxPositionNotionalPercent = 100;
+    const manager = new RiskManager();
+
+    const result = await manager.assessSignal(makeSignal({ entry: 1000, stopLoss: 950 }), 10000);
+
+    expect(result.isAllowed).toBe(true);
+    expect(result.positionSize).toBeCloseTo(2);
+    expect(result.riskAmount).toBeCloseTo(100);
   });
 
   it('rejects invalid max risk configuration', async () => {
@@ -163,6 +177,23 @@ describe('RiskManager fail-closed checks', () => {
 
     expect(result.isAllowed).toBe(false);
     expect(result.reason).toMatch(/position size|risk/i);
+  });
+
+  it('rejects invalid zero, negative, and over-100 notional cap configuration', async () => {
+    const manager = new RiskManager();
+
+    config.risk.maxPositionNotionalPercent = 0;
+    let result = await manager.assessSignal(makeSignal(), 10000);
+    expect(result.isAllowed).toBe(false);
+
+    config.risk.maxPositionNotionalPercent = -1;
+    result = await manager.assessSignal(makeSignal(), 10000);
+    expect(result.isAllowed).toBe(false);
+
+    config.risk.maxPositionNotionalPercent = 101;
+    result = await manager.assessSignal(makeSignal(), 10000);
+    expect(result.isAllowed).toBe(false);
+    expect(result.reason).toMatch(/notional/);
   });
 
   it('rejects when cooldown is active after a loss', async () => {

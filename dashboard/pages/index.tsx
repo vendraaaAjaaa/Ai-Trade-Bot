@@ -11,7 +11,6 @@ import { apiClient } from '../lib/apiClient';
 import { format } from 'date-fns';
 
 const PAIRS = ['BTCUSDT', 'ETHUSDT', 'SOLUSDT'];
-const API = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
 
 const fmt = (n: number, d = 2) => (n ?? 0).toFixed(d);
 const clx = (...a: (string | false | undefined)[]) => a.filter(Boolean).join(' ');

@@ -65,6 +65,14 @@ export class RiskManager {
       return this.reject('Invalid leverage configuration; refusing trade', balance, signal);
     }
 
+    if (
+      !Number.isFinite(config.risk.maxPositionNotionalPercent)
+      || config.risk.maxPositionNotionalPercent <= 0
+      || config.risk.maxPositionNotionalPercent > 100
+    ) {
+      return this.reject('Invalid max position notional configuration; refusing trade', balance, signal);
+    }
+
     // ---- Max daily loss check ----
     const maxDailyLoss = balance * (config.risk.maxDailyLossPercent / 100);
     const currentDailyLoss = Math.abs(Math.min(this.state.dailyPnl, 0));
@@ -122,7 +130,7 @@ export class RiskManager {
     }
 
     const rawQuantity = maxRiskAmount / riskPerUnit;
-    const maxNotionalQuantity = (balance * 0.1) / signal.entry;
+    const maxNotionalQuantity = (balance * (config.risk.maxPositionNotionalPercent / 100)) / signal.entry;
     const positionSize = Math.min(rawQuantity, maxNotionalQuantity);
     const riskAmount = positionSize * riskPerUnit;
 

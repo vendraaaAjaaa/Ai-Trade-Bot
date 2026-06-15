@@ -78,7 +78,8 @@ services:
     depends_on:
       - backend
     environment:
-      DASHBOARD_API_URL: ${DASHBOARD_API_URL:-http://localhost:3001}
+      BACKEND_API_URL: ${BACKEND_API_URL:-http://backend:3001}
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:3001}
       DASHBOARD_API_TOKEN: ${DASHBOARD_API_TOKEN:-}
     ports:
       - "${DASHBOARD_PORT:-3000}:3000"

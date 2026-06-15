@@ -158,6 +158,7 @@ export const CacheKeys = {
   dryRunWallet: () => `dryrun:wallet`,
   fundingRate: (pair: string) => `funding:${pair}`,
   riskState: () => `risk:state`,
+  liveCircuitBreaker: () => `live:circuit_breaker`,
   whaleActivity: (pair: string) => `whale:${pair}`,
   agentCache: (agent: string, pair: string) => `agent:${agent}:${pair}`,
 };

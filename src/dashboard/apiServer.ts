@@ -37,6 +37,7 @@ import { selfReviewEngine } from '../review/selfReviewEngine';
 import { db } from '../database/connection';
 import { redis } from '../redis/client';
 import { config } from '../config';
+import { liveCircuitBreaker } from '../execution/live/liveCircuitBreaker';
 import type { MTFAnalysis } from '../utils/types2';
 import type { TradingPair, Timeframe, ReplayConfig } from '../utils/types';
 import type { StrategyMode, NoTradeDecision } from '../utils/types2';
@@ -75,6 +76,9 @@ const dailyPnlQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(365).default(30),
 });
 const strategyModeBodySchema = z.object({ mode: strategyModeSchema });
+const circuitBreakerResetBodySchema = z.object({
+  reason: z.string().trim().min(8).max(500),
+});
 const candlesQuerySchema = z.object({
   timeframe: timeframeSchema.default('15m'),
   limit: z.coerce.number().int().min(1).max(500).default(200),
@@ -326,6 +330,17 @@ export function createApiServer() {
   app.get('/api/risk/state', asyncHandler(async (_req, res) => {
     const state = await riskManager.getCurrentState();
     res.json({ state });
+  }));
+
+  app.get('/api/live/circuit-breaker', asyncHandler(async (_req, res) => {
+    const state = await liveCircuitBreaker.getState();
+    res.json({ circuitBreaker: state });
+  }));
+
+  app.post('/api/live/circuit-breaker/reset', asyncHandler(async (req, res) => {
+    const { reason } = parse(circuitBreakerResetBodySchema, req.body);
+    const state = await liveCircuitBreaker.reset(reason);
+    res.json({ circuitBreaker: state });
   }));
 
   // ---- Regime ----

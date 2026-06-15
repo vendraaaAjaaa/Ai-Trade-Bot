@@ -1,6 +1,8 @@
 import type { TradingSignal } from '../../utils/types';
 
 const mockRedisStore = new Map<string, unknown>();
+let mockPositionRows: Array<Record<string, unknown>> = [];
+let mockDbFails = false;
 
 jest.mock('../../config', () => ({
   config: {
@@ -8,11 +10,16 @@ jest.mock('../../config', () => ({
       nodeEnv: 'test',
       logLevel: 'silent',
     },
+    trading: {
+      mode: 'dryrun',
+    },
     dryRun: {
       balance: 10000,
       leverage: 10,
       feeRate: 0.001,
       slippage: 0,
+      restoreOpenPositions: true,
+      strictRestore: false,
     },
   },
 }));
@@ -30,7 +37,15 @@ jest.mock('../../redis/client', () => ({
 }));
 
 jest.mock('../../database/connection', () => ({
-  db: { query: jest.fn().mockResolvedValue([]) },
+  db: {
+    query: jest.fn(async (sql: string) => {
+      if (sql.includes('FROM positions WHERE mode=$1')) {
+        if (mockDbFails) throw new Error('db unavailable');
+        return mockPositionRows;
+      }
+      return [];
+    }),
+  },
 }));
 
 jest.mock('../../risk/riskManager', () => ({
@@ -68,6 +83,8 @@ jest.mock('../../review/selfReviewEngine', () => ({
 }));
 
 import { riskManager } from '../../risk/riskManager';
+import { db } from '../../database/connection';
+import { config } from '../../config';
 import { DryRunExecutor, type VirtualWallet } from './dryRunExecutor';
 
 const riskMock = riskManager as unknown as {
@@ -75,6 +92,33 @@ const riskMock = riskManager as unknown as {
   onPositionOpened: jest.Mock;
   onPositionClosed: jest.Mock;
 };
+const dbMock = db as unknown as { query: jest.Mock };
+
+function makePositionRow(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'restored-1',
+    pair: 'BTCUSDT',
+    direction: 'LONG',
+    entry_price: 100,
+    current_price: 100,
+    quantity: 1,
+    leverage: 10,
+    margin: 10,
+    unrealized_pnl: 0,
+    realized_pnl: 0,
+    stop_loss: 90,
+    take_profit: 120,
+    liquidation_price: 90,
+    roe: 0,
+    status: 'OPEN',
+    opened_at: Date.now(),
+    closed_at: null,
+    mode: 'dryrun',
+    signal_id: 'signal-restored',
+    fees: 0.1,
+    ...overrides,
+  };
+}
 
 function makeSignal(): TradingSignal {
   return {
@@ -149,6 +193,12 @@ async function createExecutor(): Promise<DryRunExecutor> {
 describe('DryRunExecutor wallet accounting', () => {
   beforeEach(() => {
     mockRedisStore.clear();
+    mockPositionRows = [];
+    mockDbFails = false;
+    config.trading.mode = 'dryrun';
+    config.dryRun.restoreOpenPositions = true;
+    config.dryRun.strictRestore = false;
+    dbMock.query.mockClear();
     riskMock.assessSignal.mockResolvedValue({
       isAllowed: true,
       positionSize: 1,
@@ -239,5 +289,111 @@ describe('DryRunExecutor wallet accounting', () => {
     await executor.executeSignal(makeSignal());
 
     expect(riskMock.assessSignal).toHaveBeenCalledWith(expect.anything(), 1234);
+  });
+
+  it('restores one open dry-run position from DB on startup', async () => {
+    mockRedisStore.set('dryrun:wallet', {
+      balance: 9999.9,
+      equity: 9999.9,
+      usedMargin: 10,
+      freeMargin: 9989.9,
+      unrealizedPnl: 0,
+      realizedPnl: 0,
+      dailyPnl: 0,
+      fees: 0.1,
+    });
+    mockPositionRows = [makePositionRow()];
+
+    const executor = await createExecutor();
+    const positions = executor.getOpenPositions();
+    const wallet = executor.getWallet();
+
+    expect(positions).toHaveLength(1);
+    expect(positions[0]?.id).toBe('restored-1');
+    expect(wallet.balance).toBeCloseTo(9999.9);
+    expect(wallet.usedMargin).toBeCloseTo(10);
+    expect(wallet.freeMargin).toBeCloseTo(9989.9);
+  });
+
+  it('restores multiple open dry-run positions and recalculates used margin', async () => {
+    mockPositionRows = [
+      makePositionRow({ id: 'restored-1', margin: 10 }),
+      makePositionRow({ id: 'restored-2', pair: 'ETHUSDT', margin: 20, entry_price: 200, current_price: 200, stop_loss: 180, take_profit: 240, liquidation_price: 180 }),
+    ];
+
+    const executor = await createExecutor();
+    const wallet = executor.getWallet();
+
+    expect(executor.getOpenPositions()).toHaveLength(2);
+    expect(wallet.usedMargin).toBeCloseTo(30);
+    expect(wallet.freeMargin).toBeCloseTo(9970);
+  });
+
+  it('skips invalid restored position rows in non-strict mode', async () => {
+    mockPositionRows = [
+      makePositionRow({ id: 'valid-row' }),
+      makePositionRow({ id: 'invalid-row', quantity: -1 }),
+    ];
+
+    const executor = await createExecutor();
+
+    expect(executor.getOpenPositions()).toHaveLength(1);
+    expect(executor.getOpenPositions()[0]?.id).toBe('valid-row');
+  });
+
+  it('closes a restored position without double-counting margin', async () => {
+    mockRedisStore.set('dryrun:wallet', {
+      balance: 9999.9,
+      equity: 9999.9,
+      usedMargin: 10,
+      freeMargin: 9989.9,
+      unrealizedPnl: 0,
+      realizedPnl: 0,
+      dailyPnl: 0,
+      fees: 0.1,
+    });
+    mockPositionRows = [makePositionRow()];
+
+    const executor = await createExecutor();
+    await executor.closePosition('restored-1', 120, 'TP_HIT');
+    const wallet = executor.getWallet();
+
+    expect(executor.getOpenPositions()).toHaveLength(0);
+    expect(wallet.balance).toBeCloseTo(10019.78);
+    expect(wallet.usedMargin).toBe(0);
+    expect(wallet.realizedPnl).toBeCloseTo(19.78);
+    expect(wallet.fees).toBeCloseTo(0.22);
+  });
+
+  it('continues safely when DB restore fails and no margin is reserved', async () => {
+    mockDbFails = true;
+
+    const executor = await createExecutor();
+
+    expect(executor.getOpenPositions()).toHaveLength(0);
+    expect(executor.getWallet().usedMargin).toBe(0);
+  });
+
+  it('refuses initialization when DB restore fails with reserved wallet margin', async () => {
+    mockDbFails = true;
+    mockRedisStore.set('dryrun:wallet', {
+      balance: 9999.9,
+      equity: 9999.9,
+      usedMargin: 10,
+      freeMargin: 9989.9,
+      unrealizedPnl: 0,
+      realizedPnl: 0,
+      dailyPnl: 0,
+      fees: 0.1,
+    });
+
+    let rejected = false;
+    try {
+      await createExecutor();
+    } catch {
+      rejected = true;
+    }
+
+    expect(rejected).toBe(true);
   });
 });

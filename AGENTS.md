@@ -114,7 +114,7 @@ src/
 
 ### Forbidden Patterns
 
-- ❌ Direct `process.env` access outside `src/config/index.ts`
+- ❌ Direct `process.env` access outside `src/config/index.ts`, except Next.js dashboard server-only API proxy routes that must read server env such as `BACKEND_API_URL` and `DASHBOARD_API_TOKEN`
 - ❌ Circular imports between modules
 - ❌ Synchronous I/O in the signal pipeline
 - ❌ Mutable global state outside singleton instances
@@ -368,6 +368,11 @@ Agents 1-5 are **deterministic** (pure TypeScript, no API calls). Agents 6-7 are
 3. Add the env var to `.env.example` with a descriptive comment
 4. Document the field in the Phase header comment if it's a feature flag
 
+Dashboard authentication variables are special:
+- `DASHBOARD_API_TOKEN` and `BACKEND_API_TOKEN` are server-only and must never use a `NEXT_PUBLIC_` prefix.
+- Browser dashboard calls must go through local `/api/backend/*` proxy routes.
+- `NEXT_PUBLIC_API_URL` is allowed only for non-secret browser-visible connectivity such as Socket.IO.
+
 ### Feature Flag Convention
 
 All Phase features use this pattern:
@@ -544,6 +549,8 @@ npm install && npm run dev     # Start backend on :3001
 cd dashboard && npm install && npm run dev  # Start frontend on :3000
 ```
 
+For the dashboard proxy, set `BACKEND_API_URL=http://localhost:3001` during local manual runs and keep `DASHBOARD_API_TOKEN` server-only.
+
 ### Docker Deployment
 
 ```bash
@@ -551,6 +558,7 @@ docker compose --profile dryrun up -d  # Starts postgres, redis, backend, dashbo
 ```
 
 - Backend uses the `trading_net` compose network for Postgres/Redis access
+- Dashboard uses `BACKEND_API_URL=http://backend:3001` inside Compose and injects `DASHBOARD_API_TOKEN` only from the server-side proxy
 - Postgres/Redis are not exposed to the host by default
 - PostgreSQL data persisted in `postgres_data` volume
 - Redis configured with 256MB LRU eviction

@@ -14,6 +14,29 @@ import type { ExecutionQuality, MarketRegime, SessionName } from '../../utils/ty
 
 const log = createLogger('dryrun-v2');
 
+interface PositionRow {
+  id: string;
+  pair: string;
+  direction: string;
+  entry_price: string | number;
+  current_price: string | number;
+  quantity: string | number;
+  leverage: string | number;
+  margin: string | number;
+  unrealized_pnl: string | number | null;
+  realized_pnl: string | number | null;
+  stop_loss: string | number;
+  take_profit: string | number;
+  liquidation_price: string | number;
+  roe: string | number | null;
+  status: string;
+  opened_at: string | number | Date;
+  closed_at?: string | number | Date | null;
+  mode: string;
+  signal_id: string | null;
+  fees: string | number | null;
+}
+
 export interface VirtualWallet {
   balance: number;
   equity: number;
@@ -36,9 +59,8 @@ export class DryRunExecutor extends EventEmitter {
   constructor() {
     super();
     this.wallet = this.defaultWallet();
-    this.initPromise = this.loadWallet()
-      .catch((err: unknown) => log.warn({ err }, 'DryRun: Failed to load wallet; using configured dry-run balance'))
-      .finally(() => {
+    this.initPromise = this.initializeState()
+      .then(() => {
         this.recalculateWallet();
         this.initialized = true;
       });
@@ -65,9 +87,106 @@ export class DryRunExecutor extends EventEmitter {
     if (!this.initialized) await this.initPromise;
   }
 
+  private async initializeState(): Promise<void> {
+    await this.loadWallet()
+      .catch((err: unknown) => log.warn({ err }, 'DryRun: Failed to load wallet; using configured dry-run balance'));
+
+    if (!config.dryRun.restoreOpenPositions || config.trading.mode === 'live') return;
+
+    try {
+      await this.restoreOpenPositionsFromDb();
+    } catch (err) {
+      log.warn({ err }, 'DryRun: Failed to restore open positions from DB');
+      if (config.dryRun.strictRestore || this.wallet.usedMargin > 0) {
+        throw err;
+      }
+    }
+  }
+
   private async loadWallet(): Promise<void> {
     const cached = await redis.getJson<VirtualWallet>(CacheKeys.dryRunWallet());
     if (cached) this.wallet = this.normalizeWallet(cached);
+  }
+
+  private async restoreOpenPositionsFromDb(): Promise<void> {
+    const rows = await db.query<PositionRow>(
+      `SELECT id,pair,direction,entry_price,current_price,quantity,leverage,margin,
+       unrealized_pnl,realized_pnl,stop_loss,take_profit,liquidation_price,roe,
+       status,opened_at,closed_at,mode,signal_id,fees
+       FROM positions WHERE mode=$1 AND status=$2`,
+      ['dryrun', 'OPEN'],
+    );
+
+    this.openPositions.clear();
+    for (const row of rows) {
+      const position = this.positionFromRow(row);
+      if (!position) {
+        const message = `Invalid dry-run open position row skipped: ${row.id ?? 'unknown'}`;
+        if (config.dryRun.strictRestore) throw new Error(message);
+        log.warn({ rowId: row.id }, message);
+        continue;
+      }
+      this.openPositions.set(position.id, position);
+    }
+
+    this.wallet.usedMargin = Array.from(this.openPositions.values())
+      .reduce((sum, position) => sum + position.margin, 0);
+    this.recalculateWallet();
+    log.info({ restored: this.openPositions.size }, 'DryRun: Restored open positions from DB');
+  }
+
+  private positionFromRow(row: PositionRow): Position | null {
+    const pair = row.pair;
+    const direction = row.direction;
+    const entryPrice = this.toFiniteNumber(row.entry_price);
+    const currentPrice = this.toFiniteNumber(row.current_price);
+    const quantity = this.toFiniteNumber(row.quantity);
+    const leverage = this.toFiniteNumber(row.leverage);
+    const margin = this.toFiniteNumber(row.margin);
+    const stopLoss = this.toFiniteNumber(row.stop_loss);
+    const takeProfit = this.toFiniteNumber(row.take_profit);
+    const liquidationPrice = this.toFiniteNumber(row.liquidation_price);
+    const openedAt = this.toTimestamp(row.opened_at);
+
+    if (!['BTCUSDT', 'ETHUSDT', 'SOLUSDT'].includes(pair)) return null;
+    if (direction !== 'LONG' && direction !== 'SHORT') return null;
+    if ([entryPrice, currentPrice, quantity, leverage, margin, stopLoss, takeProfit, liquidationPrice].some((value) => !Number.isFinite(value) || value <= 0)) return null;
+    if (!Number.isFinite(openedAt) || openedAt <= 0) return null;
+
+    return {
+      id: row.id,
+      pair: pair as TradingPair,
+      direction,
+      entryPrice,
+      currentPrice,
+      quantity,
+      leverage,
+      margin,
+      unrealizedPnl: this.toFiniteNumber(row.unrealized_pnl, 0),
+      realizedPnl: this.toFiniteNumber(row.realized_pnl, 0),
+      stopLoss,
+      takeProfit,
+      liquidationPrice,
+      roe: this.toFiniteNumber(row.roe, 0),
+      status: 'OPEN',
+      openedAt,
+      mode: 'dryrun',
+      signalId: row.signal_id ?? 'restored',
+      fees: this.toFiniteNumber(row.fees, 0),
+    };
+  }
+
+  private toFiniteNumber(value: string | number | null | undefined, fallback = NaN): number {
+    const parsed = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+
+  private toTimestamp(value: string | number | Date): number {
+    if (value instanceof Date) return value.getTime();
+    if (typeof value === 'number') return value;
+    const numeric = Number(value);
+    if (Number.isFinite(numeric)) return numeric;
+    return new Date(value).getTime();
   }
 
   private normalizeWallet(wallet: Partial<VirtualWallet>): VirtualWallet {
