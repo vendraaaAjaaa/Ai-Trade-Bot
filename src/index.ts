@@ -38,6 +38,7 @@ async function bootstrap() {
 
   // ---- Initialize strategy & frequency state ----
   await strategyManager.initialize();
+  await dryRunExecutor.init();
   const mode = strategyManager.getMode();
   const modeCfg = strategyManager.getConfig();
   log.info({ mode, maxTrades: modeCfg.maxTradesPerDay, minConfidence: modeCfg.minConfidence }, 'Strategy mode loaded');
@@ -151,7 +152,11 @@ async function bootstrap() {
       position = await dryRunExecutor.executeSignal(signal);
     } else if (config.trading.mode === 'live') {
       const balance = await liveExecutor.getAccountBalance();
-      position = await liveExecutor.executeSignal(signal, balance);
+      const liveResult = await liveExecutor.executeSignal(signal, balance);
+      position = liveResult.position;
+      if (liveResult.status !== 'EXECUTED_WITH_PROTECTION') {
+        log.error({ status: liveResult.status, reason: liveResult.reason, pair: signal.pair }, 'Live execution did not open a protected position');
+      }
     }
 
     if (position) {

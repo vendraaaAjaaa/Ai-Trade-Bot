@@ -539,7 +539,7 @@ Every file modified as part of a Phase must include a header block:
 
 ```bash
 cp .env.example .env           # Edit with real Binance API keys
-docker compose up -d postgres redis  # Start infra
+docker compose up -d postgres redis  # Start infra without publishing DB/Redis ports
 npm install && npm run dev     # Start backend on :3001
 cd dashboard && npm install && npm run dev  # Start frontend on :3000
 ```
@@ -547,10 +547,11 @@ cd dashboard && npm install && npm run dev  # Start frontend on :3000
 ### Docker Deployment
 
 ```bash
-docker compose up -d           # Starts postgres, redis, backend, dashboard
+docker compose --profile dryrun up -d  # Starts postgres, redis, backend, dashboard
 ```
 
-- Backend uses `network_mode: "host"` for local service access
+- Backend uses the `trading_net` compose network for Postgres/Redis access
+- Postgres/Redis are not exposed to the host by default
 - PostgreSQL data persisted in `postgres_data` volume
 - Redis configured with 256MB LRU eviction
 - Logs mounted at `./logs:/app/logs`

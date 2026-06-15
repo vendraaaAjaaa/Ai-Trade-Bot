@@ -1,5 +1,6 @@
 import { spawn } from 'child_process';
 import { createLogger } from '../../utils/logger';
+import { buildChildProcessEnv } from '../../config';
 
 const log = createLogger('cli-runner');
 
@@ -55,7 +56,7 @@ function trySpawn(
     let done = false;
 
     const child = spawn(cmd, args, {
-      env: { ...process.env, ...extraEnv },
+      env: buildChildProcessEnv(extraEnv),
       shell: false,
       stdio: ['pipe', 'pipe', 'pipe'],
     });

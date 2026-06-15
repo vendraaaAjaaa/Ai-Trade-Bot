@@ -7,11 +7,9 @@ services:
     environment:
       POSTGRES_DB: trading_platform
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres123
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-change_me_strong_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
@@ -28,8 +26,6 @@ services:
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
     volumes:
       - redis_data:/data
-    ports:
-      - "6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
@@ -40,6 +36,7 @@ services:
 
   # ---- Backend API ----
   backend:
+    profiles: ["dryrun", "testnet", "production"]
     build:
       context: .
       dockerfile: docker/Dockerfile.backend
@@ -53,11 +50,12 @@ services:
     env_file:
       - .env
     environment:
-      DB_HOST: 127.0.0.1
-      REDIS_HOST: 127.0.0.1
-      NODE_ENV: production
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      NODE_ENV: ${NODE_ENV:-production}
       NODE_OPTIONS: "--dns-result-order=ipv4first"
-    network_mode: "host"
+    ports:
+      - "${BACKEND_PORT:-3001}:3001"
     volumes:
       - ./logs:/app/logs
     healthcheck:
@@ -66,9 +64,12 @@ services:
       timeout: 10s
       retries: 3
       start_period: 15s
+    networks:
+      - trading_net
 
   # ---- Frontend Dashboard ----
   dashboard:
+    profiles: ["dryrun", "testnet", "production"]
     build:
       context: ./dashboard
       dockerfile: ../docker/Dockerfile.dashboard
@@ -77,8 +78,12 @@ services:
     depends_on:
       - backend
     environment:
-      NEXT_PUBLIC_API_URL: http://localhost:3001
-    network_mode: "host"
+      DASHBOARD_API_URL: ${DASHBOARD_API_URL:-http://localhost:3001}
+      DASHBOARD_API_TOKEN: ${DASHBOARD_API_TOKEN:-}
+    ports:
+      - "${DASHBOARD_PORT:-3000}:3000"
+    networks:
+      - trading_net
 
 volumes:
   postgres_data:

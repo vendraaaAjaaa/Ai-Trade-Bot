@@ -22,12 +22,13 @@ import type { MTFAnalysis, StrategyMode } from '../utils/types2';
 import { marketDataService } from '../market/marketDataService';
 import { computeIndicators } from '../indicators/indicators';
 import { createLogger } from '../utils/logger';
+import { config } from '../config';
 
 const log = createLogger('mtf');
 
 // ---- Feature flag ----
 // Set ENABLE_RELAXED_MTF=false to revert to strict AND logic for all modes
-const ENABLE_RELAXED_MTF = process.env['ENABLE_RELAXED_MTF'] !== 'false';
+const ENABLE_RELAXED_MTF = config.featureFlags.relaxedMTF;
 
 const MTF_CONFIG: Record<StrategyMode, { trend: Timeframe; structure: Timeframe; trigger: Timeframe }> = {
   scalping:   { trend: '1h',  structure: '15m', trigger: '5m'  },

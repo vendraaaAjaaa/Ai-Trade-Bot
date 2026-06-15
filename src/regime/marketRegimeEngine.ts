@@ -18,11 +18,12 @@ import type { RegimeAnalysis, MarketRegime } from '../utils/types2';
 import { calcATR, calcEMA } from '../indicators/indicators';
 import { createLogger } from '../utils/logger';
 import { redis } from '../redis/client';
+import { config } from '../config';
 
 const log = createLogger('regime');
 
 // ---- Feature flag ----
-const ENABLE_CHOPPY_TUNING = process.env['ENABLE_CHOPPY_TUNING'] !== 'false';
+const ENABLE_CHOPPY_TUNING = config.featureFlags.choppyTuning;
 
 /**
  * Choppy detection threshold.
@@ -33,7 +34,7 @@ const ENABLE_CHOPPY_TUNING = process.env['ENABLE_CHOPPY_TUNING'] !== 'false';
  * Max possible choppy score is 9 (all five signals fire).
  */
 const CHOPPY_THRESHOLD: number = ENABLE_CHOPPY_TUNING
-  ? parseInt(process.env['CHOPPY_SCORE_THRESHOLD'] ?? '7', 10)
+  ? config.choppy.scoreThreshold
   : 5; // legacy value
 
 // Cache regime per pair for 2 minutes

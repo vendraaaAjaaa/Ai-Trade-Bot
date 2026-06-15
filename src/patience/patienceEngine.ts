@@ -23,11 +23,12 @@ import type {
   SessionInfo, MTFAnalysis, StrategyMode,
 } from '../utils/types2';
 import { createLogger } from '../utils/logger';
+import { config } from '../config';
 
 const log = createLogger('patience');
 
 // ---- Feature flag ----
-const ENABLE_SOFT_FAIL_TOLERANCE = process.env['ENABLE_SOFT_FAIL_TOLERANCE'] !== 'false';
+const ENABLE_SOFT_FAIL_TOLERANCE = config.featureFlags.softFailTolerance;
 
 /**
  * Maximum number of soft fails allowed before rejecting, per mode.

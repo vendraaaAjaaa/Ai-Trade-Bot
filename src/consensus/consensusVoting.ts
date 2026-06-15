@@ -23,27 +23,28 @@ import type {
   RegimeAnalysis, MarketQualityScore, MTFAnalysis, SessionInfo, StrategyMode,
 } from '../utils/types2';
 import { createLogger } from '../utils/logger';
+import { config } from '../config';
 
 const log = createLogger('consensus');
 
 // ---- Feature flag ----
 // Set ENABLE_DYNAMIC_CONSENSUS=false to revert to legacy 4/7 threshold
-const ENABLE_DYNAMIC_CONSENSUS = process.env['ENABLE_DYNAMIC_CONSENSUS'] !== 'false';
+const ENABLE_DYNAMIC_CONSENSUS = config.featureFlags.dynamicConsensus;
 
 /**
  * Minimum directional votes required out of 7 agents, per mode.
  * Legacy value was hardcoded 4 for all modes.
  */
 const REQUIRED_VOTES: Record<StrategyMode, number> = {
-  safe:       5,   // most conservative — was 4, now stricter
-  swing:      4,   // unchanged from legacy
-  investing:  4,   // unchanged
-  aggressive: 3,   // relaxed — allows minority-but-directional consensus
-  scalping:   3,   // relaxed — fast market, 3/7 is sufficient with veto intact
+  safe:       config.consensus.requiredVotes.safe,
+  swing:      config.consensus.requiredVotes.swing,
+  investing:  config.consensus.requiredVotes.investing,
+  aggressive: config.consensus.requiredVotes.aggressive,
+  scalping:   config.consensus.requiredVotes.scalping,
 };
 
 /** Legacy threshold kept for rollback / comparison */
-const LEGACY_REQUIRED_VOTES = 4;
+const LEGACY_REQUIRED_VOTES = config.consensus.legacyRequiredVotes;
 
 export class ConsensusVotingSystem {
 

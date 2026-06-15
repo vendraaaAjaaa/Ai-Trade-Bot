@@ -1,7 +1,12 @@
 import axios from 'axios';
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001';
-const api = axios.create({ baseURL: API_URL, timeout: 15000 });
+const API_TOKEN = process.env.NEXT_PUBLIC_DASHBOARD_API_TOKEN || '';
+const api = axios.create({
+  baseURL: API_URL,
+  timeout: 15000,
+  headers: API_TOKEN ? { Authorization: `Bearer ${API_TOKEN}` } : undefined,
+});
 
 export const apiClient = {
   // ---- Core ----

@@ -26,6 +26,7 @@
  */
 
 import { createLogger } from '../utils/logger';
+import { config } from '../config';
 import type { StrategyMode } from '../utils/types2';
 import {
   DEFAULT_SCORERS,
@@ -59,7 +60,7 @@ const log = createLogger('score-engine');
  * When true, scoring engine controls trade decisions (Phase 8).
  * When false (default), engine runs in shadow/logging mode only.
  */
-export const USE_SCORING_ENGINE = process.env['USE_SCORING_ENGINE'] === 'true';
+export const USE_SCORING_ENGINE = config.featureFlags.scoringEngineActive;
 
 export class SignalScoreEngine {
   private readonly scorers: DimensionScorer[];

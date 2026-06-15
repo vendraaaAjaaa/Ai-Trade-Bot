@@ -1,6 +1,25 @@
+/**
+ * =============================================
+ * DASHBOARD API — Phase 8 Defensive Surface Hardening
+ * =============================================
+ *
+ * Changes from Phase 8:
+ *   - All /api routes require Bearer authentication via DASHBOARD_API_TOKEN.
+ *   - CORS is restricted to CORS_ORIGINS and security headers are applied.
+ *   - Dashboard routes use Zod validation for params, query strings, and bodies.
+ *   - API errors are normalized and do not expose stack traces or secrets.
+ *
+ * Safety preserved:
+ *   - Dashboard remains a thin orchestration layer.
+ *   - Mutating endpoints still call the existing execution, replay, and strategy services.
+ */
+
+import crypto from 'crypto';
 import express from 'express';
+import type { NextFunction, Request, Response } from 'express';
 import { createServer } from 'http';
 import { Server as SocketIOServer } from 'socket.io';
+import { z, ZodError } from 'zod';
 import { createLogger } from '../utils/logger';
 import { signalEngine } from '../signals/signalEngine';
 import { dryRunExecutor } from '../execution/dryrun/dryRunExecutor';
@@ -18,98 +37,272 @@ import { selfReviewEngine } from '../review/selfReviewEngine';
 import { db } from '../database/connection';
 import { redis } from '../redis/client';
 import { config } from '../config';
-import type { TradingPair, Timeframe } from '../utils/types';
+import type { MTFAnalysis } from '../utils/types2';
+import type { TradingPair, Timeframe, ReplayConfig } from '../utils/types';
 import type { StrategyMode, NoTradeDecision } from '../utils/types2';
-import type { ReplayConfig } from '../utils/types';
 
 const log = createLogger('api-v2');
 
+const tradingPairSchema = z.preprocess(
+  (value) => (typeof value === 'string' ? value.trim().toUpperCase() : value),
+  z.enum(['BTCUSDT', 'ETHUSDT', 'SOLUSDT']),
+);
+const timeframeSchema = z.enum(['1m', '3m', '5m', '15m', '30m', '1h', '2h', '4h', '6h', '12h', '1d']);
+const strategyModeSchema = z.enum(['scalping', 'swing', 'investing', 'safe', 'aggressive']);
+const tradingModeSchema = z.enum(['live', 'dryrun', 'replay']);
+
+const pairParamsSchema = z.object({ pair: tradingPairSchema });
+const idParamsSchema = z.object({
+  id: z.string().trim().min(1).max(128).regex(/^[A-Za-z0-9:_-]+$/, 'Invalid position id format'),
+});
+const limitQuerySchema = (defaultLimit: number, maxLimit: number) => z.object({
+  limit: z.coerce.number().int().min(1).max(maxLimit).default(defaultLimit),
+});
+const signalEvaluateBodySchema = z.object({
+  pair: tradingPairSchema,
+  timeframe: timeframeSchema.default(config.trading.defaultTimeframe as Timeframe),
+});
+const tradeHistoryQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(500).default(50),
+  mode: tradingModeSchema.default(config.trading.mode),
+});
+const metricsQuerySchema = z.object({
+  pair: tradingPairSchema.optional(),
+  mode: tradingModeSchema.default(config.trading.mode),
+});
+const dailyPnlQuerySchema = z.object({
+  mode: tradingModeSchema.default(config.trading.mode),
+  days: z.coerce.number().int().min(1).max(365).default(30),
+});
+const strategyModeBodySchema = z.object({ mode: strategyModeSchema });
+const candlesQuerySchema = z.object({
+  timeframe: timeframeSchema.default('15m'),
+  limit: z.coerce.number().int().min(1).max(500).default(200),
+});
+const replayConfigSchema = z.object({
+  pair: tradingPairSchema,
+  timeframe: timeframeSchema,
+  startTime: z.number().int().positive(),
+  endTime: z.number().int().positive(),
+  speedMultiplier: z.number().finite().min(1).max(100),
+  isRunning: z.boolean().default(false),
+}).superRefine((value, ctx) => {
+  if (value.endTime <= value.startTime) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['endTime'],
+      message: 'endTime must be greater than startTime',
+    });
+  }
+});
+
+type RateLimitEntry = {
+  count: number;
+  resetAt: number;
+};
+
+type AsyncRoute = (req: Request, res: Response) => Promise<void> | void;
+
+const rateLimitBuckets = new Map<string, RateLimitEntry>();
+const allowedOrigins = new Set(config.dashboard.corsOrigins);
+
+function sendError(res: Response, status: number, code: string, message: string, details?: unknown): void {
+  res.status(status).json({
+    error: {
+      code,
+      message,
+      ...(details ? { details } : {}),
+    },
+  });
+}
+
+function formatZodError(error: ZodError): string[] {
+  return error.issues.map((issue) => `${issue.path.join('.') || 'value'}: ${issue.message}`);
+}
+
+function asyncHandler(route: AsyncRoute) {
+  return (req: Request, res: Response, _next: NextFunction): void => {
+    Promise.resolve(route(req, res)).catch((error: unknown) => {
+      if (error instanceof ZodError) {
+        sendError(res, 400, 'VALIDATION_ERROR', 'Invalid request input', formatZodError(error));
+        return;
+      }
+
+      log.error({ err: error, method: req.method, path: req.path }, 'API request failed');
+      sendError(res, 500, 'INTERNAL_ERROR', 'Request failed');
+    });
+  };
+}
+
+function parse<T>(schema: z.ZodType<T>, value: unknown): T {
+  return schema.parse(value);
+}
+
+function applySecurityHeaders(_req: Request, res: Response, next: NextFunction): void {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-site');
+  next();
+}
+
+function applyCors(req: Request, res: Response, next: NextFunction): void {
+  const origin = req.header('origin');
+  if (origin) {
+    if (!allowedOrigins.has(origin)) {
+      sendError(res, 403, 'CORS_ORIGIN_DENIED', 'Origin is not allowed');
+      return;
+    }
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Vary', 'Origin');
+  }
+
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Authorization,Content-Type');
+  res.setHeader('Access-Control-Max-Age', '600');
+
+  if (req.method === 'OPTIONS') {
+    res.sendStatus(204);
+    return;
+  }
+
+  next();
+}
+
+function applyRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const now = Date.now();
+  const key = `${req.ip || req.socket.remoteAddress || 'unknown'}:${req.header('authorization') ?? 'anonymous'}`;
+  const existing = rateLimitBuckets.get(key);
+
+  if (!existing || existing.resetAt <= now) {
+    rateLimitBuckets.set(key, { count: 1, resetAt: now + config.dashboard.rateLimitWindowMs });
+    next();
+    return;
+  }
+
+  existing.count += 1;
+  if (existing.count > config.dashboard.rateLimitMax) {
+    res.setHeader('Retry-After', Math.ceil((existing.resetAt - now) / 1000).toString());
+    sendError(res, 429, 'RATE_LIMITED', 'Too many dashboard API requests');
+    return;
+  }
+
+  next();
+}
+
+function constantTimeEquals(a: string, b: string): boolean {
+  const aBuffer = Buffer.from(a);
+  const bBuffer = Buffer.from(b);
+  return aBuffer.length === bBuffer.length && crypto.timingSafeEqual(aBuffer, bBuffer);
+}
+
+function authenticateApi(req: Request, res: Response, next: NextFunction): void {
+  if (!config.dashboard.apiToken) {
+    sendError(res, 503, 'DASHBOARD_AUTH_NOT_CONFIGURED', 'Dashboard API authentication is not configured');
+    return;
+  }
+
+  const auth = req.header('authorization') ?? '';
+  const [scheme, token] = auth.split(/\s+/);
+
+  if (scheme !== 'Bearer' || !token || !constantTimeEquals(token, config.dashboard.apiToken)) {
+    sendError(res, 401, 'UNAUTHORIZED', 'Bearer token required');
+    return;
+  }
+
+  next();
+}
+
+function socketCorsOrigin(origin: string | undefined, callback: (err: Error | null, allow?: boolean) => void): void {
+  if (!origin || allowedOrigins.has(origin)) {
+    callback(null, true);
+    return;
+  }
+
+  callback(new Error('Origin is not allowed by CORS'), false);
+}
+
 export function createApiServer() {
   const app = express();
+  app.disable('x-powered-by');
+
   const httpServer = createServer(app);
   const io = new SocketIOServer(httpServer, {
-    cors: { origin: '*', methods: ['GET', 'POST'] },
+    cors: { origin: socketCorsOrigin, methods: ['GET', 'POST'], allowedHeaders: ['Authorization', 'Content-Type'] },
     transports: ['websocket', 'polling'],
   });
 
-  app.use(express.json());
-  app.use((_req, res, next) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    if (_req.method === 'OPTIONS') { res.sendStatus(200); return; }
-    next();
-  });
+  app.use(applySecurityHeaders);
+  app.use(applyCors);
+  app.use(applyRateLimit);
+  app.use(express.json({ limit: '1mb' }));
+  app.use('/api', authenticateApi);
 
   // ---- Health ----
-  app.get('/health', async (_req, res) => {
+  app.get('/health', asyncHandler(async (_req, res) => {
     const [dbOk, redisOk] = await Promise.all([db.healthCheck(), redis.healthCheck()]);
     res.json({
       status: dbOk && redisOk ? 'ok' : 'degraded',
-      db: dbOk, redis: redisOk,
+      db: dbOk,
+      redis: redisOk,
       mode: config.trading.mode,
       strategy: strategyManager.getMode(),
       pairs: config.trading.pairs,
       timestamp: Date.now(),
     });
-  });
+  }));
 
   // ---- Signals ----
-  app.get('/api/signals', async (_req, res) => {
-    try {
-      const signals = await signalEngine.getAllLatestSignals();
-      res.json({ signals, count: signals.length });
-    } catch { res.status(500).json({ error: 'Failed to fetch signals' }); }
-  });
+  app.get('/api/signals', asyncHandler(async (_req, res) => {
+    const signals = await signalEngine.getAllLatestSignals();
+    res.json({ signals, count: signals.length });
+  }));
 
-  app.get('/api/signals/:pair', async (req, res) => {
-    try {
-      const signal = await signalEngine.getLatestSignal(req.params.pair.toUpperCase() as TradingPair);
-      res.json({ signal });
-    } catch { res.status(500).json({ error: 'Failed to fetch signal' }); }
-  });
+  app.get('/api/signals/:pair', asyncHandler(async (req, res) => {
+    const { pair } = parse(pairParamsSchema, req.params);
+    const signal = await signalEngine.getLatestSignal(pair as TradingPair);
+    res.json({ signal });
+  }));
 
-  app.post('/api/signals/evaluate', async (req, res) => {
-    try {
-      const { pair, timeframe } = req.body as { pair: TradingPair; timeframe: Timeframe };
-      const candles = await marketDataService.fetchCandles(pair, timeframe || config.trading.defaultTimeframe as Timeframe, 300);
-      const signal = await signalEngine.evaluateSignal(pair, timeframe || config.trading.defaultTimeframe as Timeframe, candles);
-      res.json({ signal });
-    } catch { res.status(500).json({ error: 'Signal evaluation failed' }); }
-  });
+  app.post('/api/signals/evaluate', asyncHandler(async (req, res) => {
+    const { pair, timeframe } = parse(signalEvaluateBodySchema, req.body);
+    const validatedPair = pair as TradingPair;
+    const validatedTimeframe = timeframe as Timeframe;
+    const candles = await marketDataService.fetchCandles(validatedPair, validatedTimeframe, 300);
+    const signal = await signalEngine.evaluateSignal(validatedPair, validatedTimeframe, candles);
+    res.json({ signal });
+  }));
 
-  app.get('/api/signals/history', async (req, res) => {
-    try {
-      const limit = parseInt(String(req.query['limit'] ?? '20'));
-      const rows = await db.query(`SELECT * FROM signals ORDER BY created_at DESC LIMIT $1`, [limit]);
-      res.json({ signals: rows });
-    } catch { res.status(500).json({ error: 'Failed to fetch signal history' }); }
-  });
+  app.get('/api/signals/history', asyncHandler(async (req, res) => {
+    const { limit } = parse(limitQuerySchema(20, 500), req.query);
+    const rows = await db.query('SELECT * FROM signals ORDER BY created_at DESC LIMIT $1', [limit]);
+    res.json({ signals: rows });
+  }));
 
   // ---- Positions ----
   app.get('/api/positions', (_req, res) => {
     res.json({ positions: dryRunExecutor.getOpenPositions() });
   });
 
-  app.get('/api/positions/history', async (req, res) => {
-    try {
-      const limit = parseInt(String(req.query['limit'] ?? '50'));
-      const mode = String(req.query['mode'] ?? config.trading.mode);
-      const trades = await performanceAnalytics.getTradeHistory(limit, mode);
-      res.json({ trades });
-    } catch { res.status(500).json({ error: 'Failed to fetch trade history' }); }
-  });
+  app.get('/api/positions/history', asyncHandler(async (req, res) => {
+    const { limit, mode } = parse(tradeHistoryQuerySchema, req.query);
+    const trades = await performanceAnalytics.getTradeHistory(limit, mode);
+    res.json({ trades });
+  }));
 
-  app.post('/api/positions/:id/close', async (req, res) => {
-    try {
-      const positions = dryRunExecutor.getOpenPositions();
-      const pos = positions.find((p) => p.id === req.params.id);
-      if (!pos) { res.status(404).json({ error: 'Position not found' }); return; }
-      const price = await marketDataService.getCurrentPrice(pos.pair as TradingPair);
-      await dryRunExecutor.closePosition(req.params.id, price, 'MANUAL');
-      res.json({ success: true });
-    } catch { res.status(500).json({ error: 'Failed to close position' }); }
-  });
+  app.post('/api/positions/:id/close', asyncHandler(async (req, res) => {
+    const { id } = parse(idParamsSchema, req.params);
+    const positions = dryRunExecutor.getOpenPositions();
+    const pos = positions.find((position) => position.id === id);
+    if (!pos) {
+      sendError(res, 404, 'POSITION_NOT_FOUND', 'Position not found');
+      return;
+    }
+    const price = await marketDataService.getCurrentPrice(pos.pair as TradingPair);
+    await dryRunExecutor.closePosition(id, price, 'MANUAL');
+    res.json({ success: true });
+  }));
 
   // ---- Wallet ----
   app.get('/api/wallet', (_req, res) => {
@@ -117,175 +310,163 @@ export function createApiServer() {
   });
 
   // ---- Analytics ----
-  app.get('/api/analytics/metrics', async (req, res) => {
-    try {
-      const { pair, mode = config.trading.mode } = req.query as { pair?: string; mode?: string };
-      const metrics = await performanceAnalytics.getMetrics(pair, undefined, undefined, mode);
-      res.json({ metrics });
-    } catch { res.status(500).json({ error: 'Failed to fetch metrics' }); }
-  });
+  app.get('/api/analytics/metrics', asyncHandler(async (req, res) => {
+    const { pair, mode } = parse(metricsQuerySchema, req.query);
+    const metrics = await performanceAnalytics.getMetrics(pair as TradingPair | undefined, undefined, undefined, mode);
+    res.json({ metrics });
+  }));
 
-  app.get('/api/analytics/daily-pnl', async (req, res) => {
-    try {
-      const { mode = config.trading.mode, days = '30' } = req.query as Record<string, string>;
-      const data = await performanceAnalytics.getDailyPnl(mode, parseInt(days));
-      res.json({ data });
-    } catch { res.status(500).json({ error: 'Failed to fetch daily PnL' }); }
-  });
+  app.get('/api/analytics/daily-pnl', asyncHandler(async (req, res) => {
+    const { mode, days } = parse(dailyPnlQuerySchema, req.query);
+    const data = await performanceAnalytics.getDailyPnl(mode, days);
+    res.json({ data });
+  }));
 
   // ---- Risk ----
-  app.get('/api/risk/state', async (_req, res) => {
-    try {
-      const state = await riskManager.getCurrentState();
-      res.json({ state });
-    } catch { res.status(500).json({ error: 'Failed to fetch risk state' }); }
-  });
+  app.get('/api/risk/state', asyncHandler(async (_req, res) => {
+    const state = await riskManager.getCurrentState();
+    res.json({ state });
+  }));
 
-  // ---- NEW: Regime ----
-  app.get('/api/regime', async (_req, res) => {
-    try {
-      const regimes: Record<string, unknown> = {};
-      for (const pair of config.trading.pairs) {
-        regimes[pair] = await marketRegimeEngine.getCached(pair as TradingPair);
-      }
-      res.json({ regimes });
-    } catch { res.status(500).json({ error: 'Failed to fetch regimes' }); }
-  });
+  // ---- Regime ----
+  app.get('/api/regime', asyncHandler(async (_req, res) => {
+    const regimes: Record<string, unknown> = {};
+    for (const pair of config.trading.pairs) {
+      regimes[pair] = await marketRegimeEngine.getCached(pair as TradingPair);
+    }
+    res.json({ regimes });
+  }));
 
-  app.get('/api/regime/:pair', async (req, res) => {
-    try {
-      const pair = req.params.pair.toUpperCase() as TradingPair;
-      const candles = await marketDataService.fetchCandles(pair, config.trading.defaultTimeframe as Timeframe, 200);
-      const regime = await marketRegimeEngine.analyze(pair, candles);
-      res.json({ regime });
-    } catch { res.status(500).json({ error: 'Failed to analyze regime' }); }
-  });
+  app.get('/api/regime/:pair', asyncHandler(async (req, res) => {
+    const { pair } = parse(pairParamsSchema, req.params);
+    const candles = await marketDataService.fetchCandles(pair as TradingPair, config.trading.defaultTimeframe as Timeframe, 200);
+    const regime = await marketRegimeEngine.analyze(pair as TradingPair, candles);
+    res.json({ regime });
+  }));
 
-  // ---- NEW: Quality ----
-  app.get('/api/quality', async (_req, res) => {
-    try {
-      const scores: Record<string, unknown> = {};
-      for (const pair of config.trading.pairs) {
-        scores[pair] = await marketQualityEngine.getCached(pair as TradingPair);
-      }
-      res.json({ scores });
-    } catch { res.status(500).json({ error: 'Failed to fetch quality scores' }); }
-  });
+  // ---- Quality ----
+  app.get('/api/quality', asyncHandler(async (_req, res) => {
+    const scores: Record<string, unknown> = {};
+    for (const pair of config.trading.pairs) {
+      scores[pair] = await marketQualityEngine.getCached(pair as TradingPair);
+    }
+    res.json({ scores });
+  }));
 
-  // ---- NEW: Session ----
+  // ---- Session ----
   app.get('/api/session', (_req, res) => {
     const session = sessionFilter.getCurrentSession();
     res.json({ session });
   });
 
-  // ---- NEW: Consensus ----
-  app.get('/api/consensus/:pair', async (req, res) => {
-    try {
-      const pair = req.params.pair.toUpperCase() as TradingPair;
-      const signal = await signalEngine.getLatestSignal(pair);
-      if (!signal) { res.json({ consensus: null }); return; }
-      const regime = await marketRegimeEngine.getCached(pair) ?? { regime: 'unknown', tradingAllowed: false, confidence: 0, trendStrength: 0, isChoppy: true, isManipulative: false, atrPercent: 0, emaFlattening: true, wickRatio: 0, fakeBreakoutFrequency: 0, description: 'No data', timestamp: Date.now() };
-      const quality = await marketQualityEngine.getCached(pair) ?? { total: 0, grade: 'no_trade' as const, trendClarity: 0, liquidityQuality: 0, volatilityQuality: 0, volumeQuality: 0, confirmationStrength: 0, tradingAllowed: false, reasons: [], timestamp: Date.now() };
-      const session = sessionFilter.getCurrentSession();
-      const mtf = { pair, strategyMode: strategyManager.getMode(), trendTimeframe: { tf: '1h', trend: signal.indicators.trend, aligned: true }, structureTimeframe: { tf: '15m', structure: signal.indicators.trend, aligned: true }, triggerTimeframe: { tf: '5m', ready: true }, overallAligned: true, alignmentScore: 80, timestamp: Date.now() };
-      const consensus = consensusVoting.vote(signal, regime, quality, mtf as any, session, strategyManager.getMode());
-      res.json({ consensus });
-    } catch { res.status(500).json({ error: 'Failed to compute consensus' }); }
-  });
+  // ---- Consensus ----
+  app.get('/api/consensus/:pair', asyncHandler(async (req, res) => {
+    const { pair } = parse(pairParamsSchema, req.params);
+    const signal = await signalEngine.getLatestSignal(pair as TradingPair);
+    if (!signal) {
+      res.json({ consensus: null });
+      return;
+    }
+    const regime = await marketRegimeEngine.getCached(pair as TradingPair)
+      ?? { regime: 'unknown' as const, tradingAllowed: false, confidence: 0, trendStrength: 0, isChoppy: true, isManipulative: false, atrPercent: 0, emaFlattening: true, wickRatio: 0, fakeBreakoutFrequency: 0, description: 'No data', timestamp: Date.now() };
+    const quality = await marketQualityEngine.getCached(pair as TradingPair)
+      ?? { total: 0, grade: 'no_trade' as const, trendClarity: 0, liquidityQuality: 0, volatilityQuality: 0, volumeQuality: 0, confirmationStrength: 0, tradingAllowed: false, reasons: [], timestamp: Date.now() };
+    const session = sessionFilter.getCurrentSession();
+    const mtf: MTFAnalysis = {
+      pair: pair as string,
+      strategyMode: strategyManager.getMode(),
+      trendTimeframe: { tf: '1h', trend: signal.indicators.trend, aligned: true },
+      structureTimeframe: { tf: '15m', structure: signal.indicators.trend, aligned: true },
+      triggerTimeframe: { tf: '5m', ready: true },
+      overallAligned: true,
+      alignmentScore: 80,
+      timestamp: Date.now(),
+    };
+    const consensus = consensusVoting.vote(signal, regime, quality, mtf, session, strategyManager.getMode());
+    res.json({ consensus });
+  }));
 
-  // ---- NEW: Strategy Mode ----
+  // ---- Strategy Mode ----
   app.get('/api/strategy/mode', (_req, res) => {
     res.json({ mode: strategyManager.getMode(), config: strategyManager.getConfig() });
   });
 
-  app.post('/api/strategy/mode', async (req, res) => {
-    try {
-      const { mode } = req.body as { mode: StrategyMode };
-      const valid: StrategyMode[] = ['scalping', 'swing', 'investing', 'safe', 'aggressive'];
-      if (!valid.includes(mode)) { res.status(400).json({ error: 'Invalid mode' }); return; }
-      await strategyManager.setMode(mode);
-      res.json({ mode, config: strategyManager.getConfig() });
-    } catch { res.status(500).json({ error: 'Failed to set strategy mode' }); }
-  });
+  app.post('/api/strategy/mode', asyncHandler(async (req, res) => {
+    const { mode } = parse(strategyModeBodySchema, req.body);
+    await strategyManager.setMode(mode as StrategyMode);
+    res.json({ mode, config: strategyManager.getConfig() });
+  }));
 
   app.get('/api/strategy/modes', (_req, res) => {
     res.json({ modes: strategyManager.getAllModes() });
   });
 
-  // ---- NEW: Frequency & Streak ----
-  app.get('/api/frequency', async (_req, res) => {
-    try {
-      const [freq, streak, status] = await Promise.all([
-        frequencyLimiter.getFrequencyState(strategyManager.getMode()),
-        frequencyLimiter.getLossStreakState(),
-        frequencyLimiter.getSystemStatus(),
-      ]);
-      res.json({ frequency: freq, streak, systemStatus: status });
-    } catch { res.status(500).json({ error: 'Failed to fetch frequency state' }); }
-  });
+  // ---- Frequency & Streak ----
+  app.get('/api/frequency', asyncHandler(async (_req, res) => {
+    const [freq, streak, status] = await Promise.all([
+      frequencyLimiter.getFrequencyState(strategyManager.getMode()),
+      frequencyLimiter.getLossStreakState(),
+      frequencyLimiter.getSystemStatus(),
+    ]);
+    res.json({ frequency: freq, streak, systemStatus: status });
+  }));
 
-  app.post('/api/frequency/reset-cooldown', async (_req, res) => {
-    try {
-      await frequencyLimiter.exitCooldown();
-      res.json({ success: true });
-    } catch { res.status(500).json({ error: 'Failed to reset cooldown' }); }
-  });
+  app.post('/api/frequency/reset-cooldown', asyncHandler(async (_req, res) => {
+    await frequencyLimiter.exitCooldown();
+    res.json({ success: true });
+  }));
 
-  // ---- NEW: Self Review ----
-  app.get('/api/review', async (req, res) => {
-    try {
-      const limit = parseInt(String(req.query['limit'] ?? '10'));
-      const reviews = await selfReviewEngine.getRecentReviews(limit);
-      res.json({ reviews });
-    } catch { res.status(500).json({ error: 'Failed to fetch reviews' }); }
-  });
+  // ---- Self Review ----
+  app.get('/api/review', asyncHandler(async (req, res) => {
+    const { limit } = parse(limitQuerySchema(10, 100), req.query);
+    const reviews = await selfReviewEngine.getRecentReviews(limit);
+    res.json({ reviews });
+  }));
 
   // ---- Market Data ----
-  app.get('/api/market/candles/:pair', async (req, res) => {
-    try {
-      const pair = req.params.pair.toUpperCase() as TradingPair;
-      const { timeframe = '15m', limit = '200' } = req.query as Record<string, string>;
-      const candles = await marketDataService.fetchCandles(pair, timeframe as Timeframe, parseInt(limit));
-      res.json({ candles, pair, timeframe });
-    } catch { res.status(500).json({ error: 'Failed to fetch candles' }); }
-  });
+  app.get('/api/market/candles/:pair', asyncHandler(async (req, res) => {
+    const { pair } = parse(pairParamsSchema, req.params);
+    const { timeframe, limit } = parse(candlesQuerySchema, req.query);
+    const candles = await marketDataService.fetchCandles(pair as TradingPair, timeframe as Timeframe, limit);
+    res.json({ candles, pair, timeframe });
+  }));
 
-  app.get('/api/market/price/:pair', async (req, res) => {
-    try {
-      const pair = req.params.pair.toUpperCase() as TradingPair;
-      const price = await marketDataService.getCurrentPrice(pair);
-      res.json({ pair, price });
-    } catch { res.status(500).json({ error: 'Failed to fetch price' }); }
-  });
+  app.get('/api/market/price/:pair', asyncHandler(async (req, res) => {
+    const { pair } = parse(pairParamsSchema, req.params);
+    const price = await marketDataService.getCurrentPrice(pair as TradingPair);
+    res.json({ pair, price });
+  }));
 
-  app.get('/api/market/funding/:pair', async (req, res) => {
-    try {
-      const pair = req.params.pair.toUpperCase() as TradingPair;
-      const funding = await marketDataService.getFundingRate(pair);
-      res.json({ funding });
-    } catch { res.status(500).json({ error: 'Failed to fetch funding' }); }
-  });
+  app.get('/api/market/funding/:pair', asyncHandler(async (req, res) => {
+    const { pair } = parse(pairParamsSchema, req.params);
+    const funding = await marketDataService.getFundingRate(pair as TradingPair);
+    res.json({ funding });
+  }));
 
   // ---- Replay ----
-  app.post('/api/replay/start', async (req, res) => {
-    try {
-      const cfg = req.body as ReplayConfig;
-      replayEngine.runReplay(cfg).then((result) => io.emit('replay_complete', result)).catch(() => {});
-      res.json({ status: 'started' });
-    } catch { res.status(500).json({ error: 'Failed to start replay' }); }
+  app.post('/api/replay/start', asyncHandler(async (req, res) => {
+    const cfg = parse(replayConfigSchema, req.body) as ReplayConfig;
+    replayEngine.runReplay(cfg)
+      .then((result) => io.emit('replay_complete', result))
+      .catch((error: unknown) => log.error({ err: error }, 'Replay failed after start'));
+    res.json({ status: 'started' });
+  }));
+
+  app.post('/api/replay/stop', (_req, res) => {
+    replayEngine.stop();
+    res.json({ status: 'stopped' });
   });
 
-  app.post('/api/replay/stop', (_req, res) => { replayEngine.stop(); res.json({ status: 'stopped' }); });
-  app.get('/api/replay/status', (_req, res) => { res.json({ isRunning: replayEngine.isActive() }); });
+  app.get('/api/replay/status', (_req, res) => {
+    res.json({ isRunning: replayEngine.isActive() });
+  });
 
   // ---- AI Analysis ----
-  app.get('/api/ai/analysis', async (req, res) => {
-    try {
-      const limit = parseInt(String(req.query['limit'] ?? '20'));
-      const rows = await db.query(`SELECT * FROM ai_analysis ORDER BY created_at DESC LIMIT $1`, [limit]);
-      res.json({ analysis: rows });
-    } catch { res.status(500).json({ error: 'Failed to fetch AI analysis' }); }
-  });
+  app.get('/api/ai/analysis', asyncHandler(async (req, res) => {
+    const { limit } = parse(limitQuerySchema(20, 500), req.query);
+    const rows = await db.query('SELECT * FROM ai_analysis ORDER BY created_at DESC LIMIT $1', [limit]);
+    res.json({ analysis: rows });
+  }));
 
   // ---- Config ----
   app.get('/api/config', (_req, res) => {
@@ -295,13 +476,19 @@ export function createApiServer() {
       strategyConfig: strategyManager.getConfig(),
       pairs: config.trading.pairs,
       timeframe: config.trading.defaultTimeframe,
+      binanceTestnet: config.binance.testnet,
+      corsOrigins: config.dashboard.corsOrigins,
     });
   });
 
   // ---- Socket.IO ----
   io.on('connection', (socket) => {
     log.debug({ id: socket.id }, 'Dashboard connected');
-    socket.on('subscribe', (pair: string) => socket.join(`pair:${pair}`));
+    socket.on('subscribe', (pair: string) => {
+      const parsed = tradingPairSchema.safeParse(pair);
+      if (!parsed.success) return;
+      socket.join(`pair:${parsed.data}`);
+    });
     socket.on('disconnect', () => log.debug({ id: socket.id }, 'Dashboard disconnected'));
   });
 

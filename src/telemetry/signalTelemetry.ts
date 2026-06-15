@@ -16,6 +16,7 @@
 
 import { redis } from '../redis/client';
 import { createLogger } from '../utils/logger';
+import { config } from '../config';
 import type {
   EntryCheckReport,
   FilterCheckResult,
@@ -26,7 +27,7 @@ import type {
 const log = createLogger('telemetry');
 
 // ---- Feature flag ----
-const DEBUG_SIGNAL_FLOW = process.env['DEBUG_SIGNAL_FLOW'] === 'true';
+const DEBUG_SIGNAL_FLOW = config.featureFlags.debugSignalFlow;
 
 // ---- Redis key builders ----
 const today = (): string => new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"

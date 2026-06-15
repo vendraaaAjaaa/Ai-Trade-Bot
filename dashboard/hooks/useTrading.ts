@@ -30,10 +30,10 @@ export function useTrading(pollMs = 5000) {
       apiClient.getHealth(),
       apiClient.getConfig(),
       // v2 endpoints
-      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'}/api/regime`).then(r => r.json()),
-      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'}/api/quality`).then(r => r.json()),
-      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'}/api/session`).then(r => r.json()),
-      fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'}/api/frequency`).then(r => r.json()),
+      apiClient.getRegimes(),
+      apiClient.getQualities(),
+      apiClient.getSession(),
+      apiClient.getFrequency(),
     ]);
 
     const [w, p, m, s, r, d, h, c, reg, qual, sess, freq] = results;
@@ -55,8 +55,7 @@ export function useTrading(pollMs = 5000) {
 
   const fetchReviews = useCallback(async () => {
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'}/api/review?limit=10`);
-      const data = await res.json();
+      const data = await apiClient.getReviews(10);
       setReviews(data.reviews || []);
     } catch {}
   }, []);
@@ -86,16 +85,12 @@ export function useTrading(pollMs = 5000) {
   }, [fetchAll]);
 
   const setStrategyMode = useCallback(async (mode: string) => {
-    await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'}/api/strategy/mode`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ mode }),
-    });
+    await apiClient.setStrategyMode(mode);
     await fetchAll();
   }, [fetchAll]);
 
   const resetCooldown = useCallback(async () => {
-    await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3001'}/api/frequency/reset-cooldown`, { method: 'POST' });
+    await apiClient.resetCooldown();
     await fetchAll();
   }, [fetchAll]);
 

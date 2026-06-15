@@ -10,17 +10,19 @@ import { frequencyLimiter } from '../../strategy/frequencyLimiter';
 import { sessionFilter } from '../../session/sessionFilter';
 import { marketRegimeEngine } from '../../regime/marketRegimeEngine';
 import type { TradingSignal, Position, RiskAssessment, TradingPair } from '../../utils/types';
-import type { ExecutionQuality } from '../../utils/types2';
+import type { ExecutionQuality, MarketRegime, SessionName } from '../../utils/types2';
 
 const log = createLogger('dryrun-v2');
 
-interface VirtualWallet {
+export interface VirtualWallet {
   balance: number;
   equity: number;
   usedMargin: number;
   freeMargin: number;
   unrealizedPnl: number;
+  realizedPnl: number;
   dailyPnl: number;
+  fees: number;
 }
 
 export class DryRunExecutor extends EventEmitter {
@@ -28,30 +30,74 @@ export class DryRunExecutor extends EventEmitter {
   private openPositions = new Map<string, Position>();
   private positionRegimes = new Map<string, string>();
   private positionSessions = new Map<string, string>();
+  private initPromise: Promise<void>;
+  private initialized = false;
 
   constructor() {
     super();
-    this.wallet = {
+    this.wallet = this.defaultWallet();
+    this.initPromise = this.loadWallet()
+      .catch((err: unknown) => log.warn({ err }, 'DryRun: Failed to load wallet; using configured dry-run balance'))
+      .finally(() => {
+        this.recalculateWallet();
+        this.initialized = true;
+      });
+  }
+
+  async init(): Promise<void> {
+    await this.initPromise;
+  }
+
+  private defaultWallet(): VirtualWallet {
+    return {
       balance: config.dryRun.balance,
       equity: config.dryRun.balance,
       usedMargin: 0,
       freeMargin: config.dryRun.balance,
       unrealizedPnl: 0,
+      realizedPnl: 0,
       dailyPnl: 0,
+      fees: 0,
     };
-    this.loadWallet();
+  }
+
+  private async ensureInitialized(): Promise<void> {
+    if (!this.initialized) await this.initPromise;
   }
 
   private async loadWallet(): Promise<void> {
     const cached = await redis.getJson<VirtualWallet>(CacheKeys.dryRunWallet());
-    if (cached) this.wallet = cached;
+    if (cached) this.wallet = this.normalizeWallet(cached);
+  }
+
+  private normalizeWallet(wallet: Partial<VirtualWallet>): VirtualWallet {
+    const balance = this.finiteOr(wallet.balance, config.dryRun.balance);
+    const usedMargin = this.finiteOr(wallet.usedMargin, 0);
+    const unrealizedPnl = this.finiteOr(wallet.unrealizedPnl, 0);
+    const equity = this.finiteOr(wallet.equity, balance + unrealizedPnl);
+    return {
+      balance,
+      equity,
+      usedMargin,
+      freeMargin: this.finiteOr(wallet.freeMargin, equity - usedMargin),
+      unrealizedPnl,
+      realizedPnl: this.finiteOr(wallet.realizedPnl, 0),
+      dailyPnl: this.finiteOr(wallet.dailyPnl, 0),
+      fees: this.finiteOr(wallet.fees, 0),
+    };
+  }
+
+  private finiteOr(value: number | undefined, fallback: number): number {
+    return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
   }
 
   private async saveWallet(): Promise<void> {
-    await redis.setJson(CacheKeys.dryRunWallet(), this.wallet, 86400);
+    await redis.setJson(CacheKeys.dryRunWallet(), this.wallet, 86400)
+      .catch((err: unknown) => log.warn({ err }, 'DryRun: Failed to persist wallet'));
   }
 
   async executeSignal(signal: TradingSignal): Promise<Position | null> {
+    await this.ensureInitialized();
     const risk = await riskManager.assessSignal(signal, this.wallet.balance);
     if (!risk.isAllowed) {
       log.warn({ reason: risk.reason, pair: signal.pair }, 'DryRun: Trade rejected by risk manager');
@@ -60,7 +106,7 @@ export class DryRunExecutor extends EventEmitter {
     return this.openPosition(signal, risk);
   }
 
-  private async openPosition(signal: TradingSignal, risk: RiskAssessment): Promise<Position> {
+  private async openPosition(signal: TradingSignal, risk: RiskAssessment): Promise<Position | null> {
     const isLong = signal.direction === 'LONG';
     const leverage = risk.leverage;
     const quantity = risk.positionSize;
@@ -72,6 +118,20 @@ export class DryRunExecutor extends EventEmitter {
 
     const margin = (quantity * filledPrice) / leverage;
     const fee = quantity * filledPrice * config.dryRun.feeRate;
+    if (!Number.isFinite(margin) || margin <= 0 || !Number.isFinite(fee) || fee < 0) {
+      log.warn({ pair: signal.pair, margin, fee }, 'DryRun: Invalid margin or fee; refusing position');
+      return null;
+    }
+
+    if (margin + fee > this.wallet.freeMargin) {
+      log.warn({
+        pair: signal.pair,
+        required: margin + fee,
+        freeMargin: this.wallet.freeMargin,
+      }, 'DryRun: Insufficient free margin; refusing position');
+      return null;
+    }
+
     const maintenanceMarginRate = 0.004;
     const liquidationPrice = isLong
       ? filledPrice * (1 - 1 / leverage + maintenanceMarginRate)
@@ -119,8 +179,9 @@ export class DryRunExecutor extends EventEmitter {
     };
 
     this.wallet.balance -= fee;
+    this.wallet.fees += fee;
     this.wallet.usedMargin += margin;
-    this.wallet.freeMargin = this.wallet.balance - this.wallet.usedMargin;
+    this.recalculateWallet();
 
     this.openPositions.set(position.id, position);
     await this.saveWallet();
@@ -146,6 +207,7 @@ export class DryRunExecutor extends EventEmitter {
   }
 
   async updatePositionPrice(pair: TradingPair, currentPrice: number): Promise<void> {
+    await this.ensureInitialized();
     for (const [id, pos] of this.openPositions) {
       if (pos.pair !== pair) continue;
       const isLong = pos.direction === 'LONG';
@@ -168,35 +230,36 @@ export class DryRunExecutor extends EventEmitter {
       }
     }
 
-    const totalUnrealized = Array.from(this.openPositions.values())
-      .filter((p) => p.pair === pair)
-      .reduce((s, p) => s + p.unrealizedPnl, 0);
-
-    this.wallet.unrealizedPnl = totalUnrealized;
-    this.wallet.equity = this.wallet.balance + totalUnrealized;
+    this.recalculateWallet();
     await this.saveWallet();
   }
 
   async closePosition(positionId: string, price: number, reason: 'TP_HIT' | 'SL_HIT' | 'MANUAL'): Promise<void> {
+    await this.ensureInitialized();
     const pos = this.openPositions.get(positionId);
     if (!pos) return;
 
     const isLong = pos.direction === 'LONG';
-    const closeFee = pos.quantity * price * config.dryRun.feeRate;
     const exitPrice = isLong ? price * (1 - config.dryRun.slippage) : price * (1 + config.dryRun.slippage);
+    const closeFee = pos.quantity * exitPrice * config.dryRun.feeRate;
     const priceDiff = isLong ? exitPrice - pos.entryPrice : pos.entryPrice - exitPrice;
+    const grossPnl = priceDiff * pos.quantity;
 
-    pos.realizedPnl = priceDiff * pos.quantity - pos.fees - closeFee;
+    pos.realizedPnl = grossPnl - pos.fees - closeFee;
+    pos.fees += closeFee;
+    pos.unrealizedPnl = 0;
     pos.currentPrice = exitPrice;
     pos.status = 'CLOSED';
     pos.closedAt = Date.now();
 
-    this.wallet.balance += pos.realizedPnl + pos.margin;
+    this.wallet.balance += grossPnl - closeFee;
     this.wallet.usedMargin = Math.max(0, this.wallet.usedMargin - pos.margin);
-    this.wallet.freeMargin = this.wallet.balance - this.wallet.usedMargin;
+    this.wallet.realizedPnl += pos.realizedPnl;
     this.wallet.dailyPnl += pos.realizedPnl;
+    this.wallet.fees += closeFee;
 
     this.openPositions.delete(positionId);
+    this.recalculateWallet();
     await this.saveWallet();
     await this.updatePositionInDb(pos);
 
@@ -207,8 +270,8 @@ export class DryRunExecutor extends EventEmitter {
     await riskManager.onPositionClosed(pos.realizedPnl);
 
     // Self-review
-    const regimeAtEntry = (this.positionRegimes.get(positionId) ?? 'unknown') as any;
-    const sessionAtEntry = (this.positionSessions.get(positionId) ?? 'dead') as any;
+    const regimeAtEntry = (this.positionRegimes.get(positionId) ?? 'unknown') as MarketRegime;
+    const sessionAtEntry = (this.positionSessions.get(positionId) ?? 'dead') as SessionName;
     this.positionRegimes.delete(positionId);
     this.positionSessions.delete(positionId);
 
@@ -222,24 +285,31 @@ export class DryRunExecutor extends EventEmitter {
   }
 
   private async liquidatePosition(positionId: string, price: number): Promise<void> {
+    await this.ensureInitialized();
     const pos = this.openPositions.get(positionId);
     if (!pos) return;
 
-    pos.realizedPnl = -pos.margin;
+    const liquidationFee = pos.quantity * price * config.dryRun.feeRate;
+    pos.realizedPnl = -pos.margin - pos.fees - liquidationFee;
+    pos.fees += liquidationFee;
+    pos.unrealizedPnl = 0;
     pos.status = 'LIQUIDATED';
     pos.closedAt = Date.now();
     pos.currentPrice = price;
 
+    this.wallet.balance -= pos.margin + liquidationFee;
     this.wallet.usedMargin = Math.max(0, this.wallet.usedMargin - pos.margin);
-    this.wallet.freeMargin = this.wallet.balance - this.wallet.usedMargin;
-    this.wallet.dailyPnl -= pos.margin;
+    this.wallet.realizedPnl += pos.realizedPnl;
+    this.wallet.dailyPnl += pos.realizedPnl;
+    this.wallet.fees += liquidationFee;
 
     this.openPositions.delete(positionId);
+    this.recalculateWallet();
     await this.saveWallet();
     await this.updatePositionInDb(pos);
 
     await frequencyLimiter.recordLoss();
-    await riskManager.onPositionClosed(-pos.margin);
+    await riskManager.onPositionClosed(pos.realizedPnl);
 
     log.warn({ id: pos.id, price: price.toFixed(4) }, 'DryRun: Position LIQUIDATED');
     this.emit('position_liquidated', pos);
@@ -247,6 +317,14 @@ export class DryRunExecutor extends EventEmitter {
 
   getWallet(): VirtualWallet { return { ...this.wallet }; }
   getOpenPositions(): Position[] { return Array.from(this.openPositions.values()); }
+
+  private recalculateWallet(): void {
+    const totalUnrealized = Array.from(this.openPositions.values())
+      .reduce((sum, position) => sum + position.unrealizedPnl, 0);
+    this.wallet.unrealizedPnl = totalUnrealized;
+    this.wallet.equity = this.wallet.balance + totalUnrealized;
+    this.wallet.freeMargin = this.wallet.equity - this.wallet.usedMargin;
+  }
 
   private async persistPosition(pos: Position): Promise<void> {
     await db.query(

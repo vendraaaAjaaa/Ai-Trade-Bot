@@ -24,10 +24,15 @@ export class RiskManager {
   };
 
   async loadState(): Promise<void> {
-    const cached = await redis.getJson<RiskState>(CacheKeys.riskState());
-    if (cached && this.isSameDay(cached.lastUpdated)) {
-      this.state = cached;
-    } else {
+    try {
+      const cached = await redis.getJson<RiskState>(CacheKeys.riskState());
+      if (cached && this.isSameDay(cached.lastUpdated)) {
+        this.state = cached;
+      } else {
+        await this.resetDailyState();
+      }
+    } catch (err) {
+      log.warn({ err }, 'Risk state unavailable; resetting conservatively');
       await this.resetDailyState();
     }
   }
@@ -35,6 +40,30 @@ export class RiskManager {
   async assessSignal(signal: TradingSignal, balance: number): Promise<RiskAssessment> {
     await this.loadState();
     const warnings: string[] = [];
+
+    if (!Number.isFinite(balance) || balance <= 0) {
+      return this.reject('Invalid account balance; refusing trade', balance, signal);
+    }
+
+    const numericInputs = [
+      signal.entry,
+      signal.stopLoss,
+      signal.takeProfit,
+      signal.riskReward,
+      signal.confidence,
+      signal.indicators.atr,
+    ];
+    if (numericInputs.some((value) => !Number.isFinite(value))) {
+      return this.reject('Signal contains invalid numeric values; refusing trade', balance, signal);
+    }
+
+    if (signal.entry <= 0 || signal.stopLoss <= 0 || signal.takeProfit <= 0) {
+      return this.reject('Signal prices must be positive; refusing trade', balance, signal);
+    }
+
+    if (config.risk.defaultLeverage > config.risk.maxLeverage || config.risk.maxLeverage > 20) {
+      return this.reject('Invalid leverage configuration; refusing trade', balance, signal);
+    }
 
     // ---- Max daily loss check ----
     const maxDailyLoss = balance * (config.risk.maxDailyLossPercent / 100);
@@ -80,12 +109,30 @@ export class RiskManager {
       );
     }
 
-    // ---- Position sizing (Kelly-adjusted, max 10% balance) ----
+    // ---- Position sizing (risk-based sizing with max-notional cap) ----
     const slDistance = Math.abs(signal.stopLoss - signal.entry) / signal.entry;
+    if (!Number.isFinite(slDistance) || slDistance <= 0) {
+      return this.reject('Stop-loss distance is zero or invalid; refusing trade', balance, signal);
+    }
+
     const maxRiskAmount = balance * (config.risk.maxPositionSizePercent / 100);
     const riskPerUnit = slDistance * signal.entry;
-    const rawQuantity = riskPerUnit > 0 ? maxRiskAmount / (riskPerUnit) : 0;
-    const positionSize = Math.min(rawQuantity, balance * 0.1 / signal.entry);
+    if (!Number.isFinite(riskPerUnit) || riskPerUnit <= 0) {
+      return this.reject('Risk per unit is invalid; refusing trade', balance, signal);
+    }
+
+    const rawQuantity = maxRiskAmount / riskPerUnit;
+    const maxNotionalQuantity = (balance * 0.1) / signal.entry;
+    const positionSize = Math.min(rawQuantity, maxNotionalQuantity);
+    const riskAmount = positionSize * riskPerUnit;
+
+    if (!Number.isFinite(positionSize) || positionSize <= 0) {
+      return this.reject('Calculated position size is zero or invalid; refusing trade', balance, signal);
+    }
+
+    if (riskAmount > maxRiskAmount + 1e-8) {
+      return this.reject('Calculated risk exceeds maximum allowed risk; refusing trade', balance, signal);
+    }
 
     // ---- Spread check ----
     const leverage = Math.min(config.risk.defaultLeverage, config.risk.maxLeverage);
@@ -101,7 +148,7 @@ export class RiskManager {
     return {
       isAllowed: true,
       positionSize,
-      riskAmount: positionSize * riskPerUnit,
+      riskAmount,
       leverage,
       stopLossDistance: slDistance,
       riskReward: signal.riskReward,
@@ -163,7 +210,8 @@ export class RiskManager {
 
   private async saveState(): Promise<void> {
     this.state.lastUpdated = Date.now();
-    await redis.setJson(CacheKeys.riskState(), this.state, 86400);
+    await redis.setJson(CacheKeys.riskState(), this.state, 86400)
+      .catch((err) => log.warn({ err }, 'Failed to persist risk state'));
   }
 
   private isSameDay(timestamp: number): boolean {
@@ -175,10 +223,15 @@ export class RiskManager {
   }
 
   private async countOpenPositions(): Promise<number> {
-    const rows = await db.query<{ count: string }>(
-      `SELECT COUNT(*) as count FROM positions WHERE status='OPEN'`,
-    );
-    return parseInt(rows[0]?.count ?? '0');
+    try {
+      const rows = await db.query<{ count: string }>(
+        `SELECT COUNT(*) as count FROM positions WHERE status='OPEN'`,
+      );
+      return parseInt(rows[0]?.count ?? '0');
+    } catch (err) {
+      log.error({ err }, 'Failed to count open positions; assuming max positions reached');
+      return config.risk.maxOpenPositions;
+    }
   }
 
   private async logRiskEvent(type: string, pnl: number): Promise<void> {
@@ -190,7 +243,7 @@ export class RiskManager {
         `Position closed with PnL: $${pnl.toFixed(2)}`,
         JSON.stringify({ pnl, dailyPnl: this.state.dailyPnl }),
       ],
-    ).catch(() => {});
+    ).catch((err) => log.warn({ err }, 'Failed to log risk event'));
   }
 }
 
